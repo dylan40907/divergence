@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
-import json
 import os
 import platform
 import time
@@ -17,7 +16,8 @@ from pathlib import Path
 from divergence import __version__
 from divergence.adapters import adapter_for
 from divergence.artifacts import MIB, evidence_digest
-from divergence.models import Comparison, Scenario, load_trace, safe_child
+from divergence.evidence import read_run, validate_saved_trials
+from divergence.models import Comparison, Scenario, load_trace
 from divergence.oracle import compare
 from divergence.process import run_command
 from divergence.revisions import GitProvider, python_regions, rank_changes
@@ -96,6 +96,7 @@ class Search:
         self.verify_only = verify_only
         self.retry_inconclusive = False
         self.retried: set[str] = set()
+        self.validated: set[str] = set()
 
     @classmethod
     def for_verification(
@@ -127,14 +128,9 @@ class Search:
             previous_attempts = saved.get("previous_attempts", []) + [
                 {key: value for key, value in saved.items() if key != "previous_attempts"}
             ]
-            for attempt_result in previous_attempts:
-                for item in attempt_result["captures"]:
-                    folder = safe_child(self.output, item["path"])
-                    if self.capture_digest(folder) != item["digest"]:
-                        raise ValueError(
-                            "saved evidence changed; start a new run rather than reusing it"
-                        )
-                    load_trace(folder / "trace.json").validate_for(self.scenario, folder)
+            if revision not in self.validated:
+                validate_saved_trials(self.output, {"trials": {revision: saved}}, self.scenario)
+                self.validated.add(revision)
             if not (
                 self.retry_inconclusive
                 and saved.get("retryable", False)
@@ -151,6 +147,7 @@ class Search:
         captures = []
         comparisons = []
         errors = []
+        diagnostic_paths = []
         execution_failure = False
         semantic_uncertainty = False
         stage = "checkout"
@@ -183,6 +180,15 @@ class Search:
                 comparisons.append(compare(reference, trace, self.scenario, ref_dir, folder))
             except (ValueError, RuntimeError, OSError) as exc:
                 errors.append(f"{stage}: {exc}")
+                if folder.exists():
+                    diagnostic_paths.append(folder.relative_to(self.output).as_posix())
+                if stage == "build":
+                    diagnostic_paths.extend(
+                        path.relative_to(self.output).as_posix()
+                        for path in (self.output / "logs").glob(
+                            f"{revision[:12]}-{attempt}-{repeat}-build-*.log"
+                        )
+                    )
                 execution_failure = stage in {"checkout", "build", "capture"}
                 break
             finally:
@@ -267,6 +273,7 @@ class Search:
             "comparison_basis": comparison_basis,
             "repeat_verdicts": [comparison.verdict for comparison in comparisons],
             "errors": errors,
+            "diagnostic_paths": diagnostic_paths,
             "retryable": verdict == "INCONCLUSIVE"
             and execution_failure
             and not semantic_uncertainty
@@ -283,6 +290,7 @@ class Search:
             raise ValueError("--retry-inconclusive requires --resume and an existing run")
         self.retry_inconclusive = retry_inconclusive
         self.retried.clear()
+        self.validated.clear()
         self.reference = None
         with run_lock(self.output):
             return self._run(resume)
@@ -301,11 +309,13 @@ class Search:
         if manifest.exists():
             if not resume:
                 raise ValueError("output already contains a run; use --resume or a new --output")
-            self.state = json.loads(manifest.read_text(encoding="utf-8"))
+            self.state, _ = read_run(self.output)
             if self.state.get("identity") != identity:
                 raise ValueError(
                     "scenario, runner, environment, or revisions changed; use a new output directory"
                 )
+            validate_saved_trials(self.output, self.state, self.scenario)
+            self.validated.update(self.state["trials"])
         else:
             if any(path.name != ".lock" for path in self.output.iterdir()):
                 raise ValueError("a new run requires an empty output directory")

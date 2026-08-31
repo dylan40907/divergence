@@ -170,6 +170,13 @@ def test_server_only_serves_reports_and_rejects_host_header(tmp_path):
     )
     (folder / "report.html").write_text("<h1>report</h1>")
     (folder / "secret.txt").write_text("secret")
+    for index, malformed in enumerate(
+        [{}, [], None, {"scenario": None}, {"scenario": {"name": 5}}]
+    ):
+        broken = tmp_path / f"broken-{index}"
+        broken.mkdir()
+        (broken / "run.json").write_text(json.dumps(malformed))
+        (broken / "report.html").write_text("<h1>unusable</h1>")
     server = make_server(tmp_path, 0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

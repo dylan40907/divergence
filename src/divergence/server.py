@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from divergence.artifacts import MIB
+
 
 def make_server(root: Path, port: int = 8741) -> http.server.ThreadingHTTPServer:
     root = root.resolve()
@@ -30,14 +32,22 @@ def make_server(root: Path, port: int = 8741) -> http.server.ThreadingHTTPServer
                     if not manifest.resolve().is_relative_to(root):
                         continue
                     try:
+                        if manifest.stat().st_size > 64 * MIB:
+                            continue
                         run = json.loads(manifest.read_text(encoding="utf-8"))
-                    except (ValueError, OSError):
+                        scenario_name = run["scenario"]["name"]
+                        status, created_at = run["status"], run["created_at"]
+                        if not all(
+                            isinstance(item, str) for item in (scenario_name, status, created_at)
+                        ):
+                            continue
+                    except (ValueError, OSError, KeyError, TypeError):
                         continue
                     if not (manifest.parent / "report.html").exists():
                         continue
                     name = manifest.parent.name
                     rows.append(
-                        f'<a href="/{html.escape(name, quote=True)}/report.html"><b>{html.escape(run["scenario"]["name"])}</b><span>{html.escape(run["status"])} · {html.escape(run["created_at"][:16])}</span></a>'
+                        f'<a href="/{html.escape(name, quote=True)}/report.html"><b>{html.escape(scenario_name)}</b><span>{html.escape(status)} · {html.escape(created_at[:16])}</span></a>'
                     )
                 body = (
                     '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Divergence · Investigations</title>'
