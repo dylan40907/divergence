@@ -9,7 +9,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from divergence.models import load_trace, safe_child
+from divergence.artifacts import MIB, inspect_artifacts
+from divergence.models import Scenario, load_trace, safe_child
 
 
 def image_data(path: Path) -> str:
@@ -22,11 +23,17 @@ def image_data(path: Path) -> str:
 
 def render_report(run_dir: Path, destination: Path | None = None) -> Path:
     state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    scenario = Scenario.model_validate(state["scenario"])
     payload = {"run": state, "traces": {}}
     for sha, trial in state["trials"].items():
         if not trial["captures"]:
             continue
         directory = safe_child(run_dir, trial["captures"][0]["path"])
+        inspect_artifacts(
+            directory,
+            max_bytes=scenario.capture_limits.max_mb * MIB,
+            max_entries=scenario.capture_limits.max_entries,
+        )
         trace = load_trace(directory / "trace.json")
         # Keep full traces on disk; bound portable-report image count and state payload.
         step = max(1, (len(trace.samples) - 1 + 299) // 300)

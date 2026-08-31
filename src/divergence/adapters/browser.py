@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+from divergence.diagnostics import browser_step
 from divergence.models import LogEntry, Sample, Scenario, Trace, safe_child
 from divergence.storage import atomic_json
 
@@ -39,7 +40,8 @@ def capture(source: Path, output: Path, scenario: Scenario) -> None:
     pending_logs: list[LogEntry] = []
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            with browser_step("launch"):
+                browser = pw.chromium.launch(headless=True)
             context = browser.new_context(
                 viewport={
                     "width": scenario.browser.viewport[0],
@@ -87,38 +89,43 @@ def capture(source: Path, output: Path, scenario: Scenario) -> None:
             )
             page.clock.install(time=scenario.browser.clock_epoch_ms - 60000)
             page.clock.pause_at(scenario.browser.clock_epoch_ms)
-            page.goto(f"{origin}/{entry.relative_to(source).as_posix()}", wait_until="load")
-            page.evaluate(scenario.browser.reset_expression, scenario.seed)
+            with browser_step("navigation"):
+                page.goto(f"{origin}/{entry.relative_to(source).as_posix()}", wait_until="load")
+            with browser_step("reset_expression", 0):
+                page.evaluate(scenario.browser.reset_expression, scenario.seed)
             for t in range(0, scenario.duration_ms + 1, scenario.sample_ms):
                 if t:
                     if scenario.browser.tick_expression:
-                        page.evaluate(scenario.browser.tick_expression, scenario.sample_ms)
+                        with browser_step("tick_expression", t):
+                            page.evaluate(scenario.browser.tick_expression, scenario.sample_ms)
                     else:
                         page.clock.run_for(scenario.sample_ms)
                 for action in scenario.browser.actions:
                     if action.at_ms != t:
                         continue
-                    if action.kind == "evaluate":
-                        page.evaluate(action.value)
-                    elif action.kind == "click":
-                        page.locator(action.target).click(timeout=5000)
-                    elif action.kind == "press":
-                        target = page.locator(action.target)
-                        # Body is not focusable by default. Without clearing focus,
-                        # Playwright sends a recorded page shortcut to the last input.
-                        target.evaluate(
-                            "element => {if(element === document.body) document.activeElement?.blur()}"
-                        )
-                        target.press(action.value)
-                    else:
-                        page.locator(action.target).fill(action.value)
-                snapshot = page.evaluate(scenario.browser.state_expression)
+                    with browser_step("action", t):
+                        if action.kind == "evaluate":
+                            page.evaluate(action.value)
+                        elif action.kind == "click":
+                            page.locator(action.target).click(timeout=5000)
+                        elif action.kind == "press":
+                            target = page.locator(action.target)
+                            # Body is not focusable by default. Clear the prior focus.
+                            target.evaluate(
+                                "element => {if(element === document.body) document.activeElement?.blur()}"
+                            )
+                            target.press(action.value)
+                        else:
+                            page.locator(action.target).fill(action.value)
+                with browser_step("state_expression", t):
+                    snapshot = page.evaluate(scenario.browser.state_expression)
                 name = f"frames/{len(samples):05d}.png"
                 page.screenshot(
                     path=str(output / name),
                     animations="disabled" if scenario.browser.disable_animations else "allow",
                 )
-                sample = Sample(t_ms=t, **snapshot, frame=name)
+                with browser_step("snapshot", t):
+                    sample = Sample(t_ms=t, **snapshot, frame=name)
                 sample.logs.extend(pending_logs)
                 pending_logs.clear()
                 samples.append(sample)
@@ -143,8 +150,14 @@ def capture(source: Path, output: Path, scenario: Scenario) -> None:
 
 
 if __name__ == "__main__":
-    capture(
-        Path(sys.argv[1]),
-        Path(sys.argv[2]),
-        Scenario.model_validate_json(Path(sys.argv[3]).read_text()),
-    )
+    try:
+        capture(
+            Path(sys.argv[1]),
+            Path(sys.argv[2]),
+            Scenario.model_validate_json(Path(sys.argv[3]).read_text()),
+        )
+    except Exception as exc:
+        # An explicit bounded diagnostic lets the parent show the useful context
+        # without echoing the entire worker log or traceback into the report.
+        atomic_json(Path(sys.argv[2]) / "diagnostic.json", {"message": str(exc)[:4000]})
+        raise

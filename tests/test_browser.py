@@ -69,6 +69,42 @@ def test_virtual_timer_does_not_include_wall_clock_capture_time(tmp_path):
     assert [sample.state for sample in first.samples] == [sample.state for sample in second.samples]
 
 
+@pytest.mark.parametrize("failure", ["reset", "selector", "snapshot"])
+def test_browser_failure_explains_stage_and_retains_diagnostic(tmp_path, failure):
+    from divergence.process import ExecutionError
+
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "index.html").write_text(
+        '<!doctype html><title>Plain app</title><button id="present">Continue</button>'
+    )
+    scenario = Scenario(
+        name="setup failure",
+        adapter="browser",
+        duration_ms=100,
+        sample_ms=100,
+        assertions=[{"path": "ready", "value": True}],
+        browser={"reset_expression": "() => {}", "state_expression": "({state:{ready:true}})"},
+    )
+    if failure == "reset":
+        scenario.browser.reset_expression = "seed => window.divergence.reset(seed)"
+        expected = "Browser reset_expression failed at 0 ms"
+    elif failure == "selector":
+        from divergence.models import Action
+
+        scenario.browser.actions = [Action(at_ms=100, kind="click", target="#missing")]
+        expected = "Browser action failed at 100 ms"
+    else:
+        scenario.browser.state_expression = "null"
+        expected = "Browser snapshot failed at 0 ms"
+    output = tmp_path / "capture"
+    with pytest.raises(ExecutionError, match=expected):
+        BrowserAdapter().capture(source, output, scenario)
+    assert (output / "diagnostic.json").is_file()
+    assert (output / "process.log").is_file()
+    assert not (output / "trace.json").exists()
+
+
 def test_dom_only_cart_history_finds_repeated_coupon_bug(tmp_path):
     demo = create_demo(tmp_path / "cart", commits=8, bug_at=6, adapter="browser", fixture="cart")
     scenario = load_scenario(Path(demo["scenario"]))
@@ -80,6 +116,28 @@ def test_dom_only_cart_history_finds_repeated_coupon_bug(tmp_path):
     assert result["trials"][result["culprit"]]["comparison"]["first_divergence_ms"] == 1500
     assert "if (couponApplied) return;" in result["diff"]
     assert len(result["trials"]) <= 5
+
+
+def test_browser_capture_uses_filesystem_entry_limit(tmp_path):
+    from divergence.artifacts import ArtifactLimitError
+    from divergence.process import ExecutionError
+
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "index.html").write_text("<!doctype html><title>Capture limit</title>Local fixture")
+    scenario = Scenario(
+        name="bounded browser",
+        adapter="browser",
+        duration_ms=100,
+        sample_ms=100,
+        assertions=[{"path": "ready", "value": True}],
+        browser={"reset_expression": "() => {}", "state_expression": "({state:{ready:true}})"},
+        capture_limits={"max_entries": 2},
+    )
+    with pytest.raises(
+        (ArtifactLimitError, ExecutionError), match="capture exceeded 2 filesystem entries"
+    ):
+        BrowserAdapter().capture(source, tmp_path / "capture", scenario)
 
 
 def test_recorder_keyboard_duplicate_selectors_and_private_fields(tmp_path):

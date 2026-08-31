@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from divergence.artifacts import MIB, inspect_artifacts
+
 
 class ExecutionError(RuntimeError):
     pass
@@ -58,6 +60,10 @@ def run_command(
     timeout: int,
     log: Path,
     extra_env: dict[str, str] | None = None,
+    *,
+    capture_dir: Path | None = None,
+    capture_max_mb: int = 512,
+    capture_max_entries: int = 20000,
 ) -> None:
     if not argv:
         raise ExecutionError("empty command")
@@ -73,6 +79,14 @@ def run_command(
     flags = (
         subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     )
+
+    def check_capture():
+        if capture_dir is not None:
+            inspect_artifacts(
+                capture_dir, max_bytes=capture_max_mb * MIB, max_entries=capture_max_entries
+            )
+
+    check_capture()
     with log.open("wb") as output:
         try:
             process = subprocess.Popen(
@@ -90,12 +104,16 @@ def run_command(
             raise ExecutionError(f"could not start {argv[0]}: {exc}") from exc
         try:
             deadline = time.monotonic() + timeout
+            next_capture_check = 0.0
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv, timeout)
                 if log.stat().st_size > 16 * 1024 * 1024:
                     raise ExecutionError(f"command log exceeded 16 MiB; see {log.name}")
+                if time.monotonic() >= next_capture_check:
+                    check_capture()
+                    next_capture_check = time.monotonic() + 0.5
                 try:
                     code = process.wait(timeout=min(0.25, remaining))
                     break
@@ -115,3 +133,4 @@ def run_command(
         raise ExecutionError(f"command exited {code}; see {log.name}")
     if log.stat().st_size > 16 * 1024 * 1024:
         raise ExecutionError(f"command log exceeded 16 MiB; see {log.name}")
+    check_capture()

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from divergence import __version__
 from divergence.adapters import adapter_for
+from divergence.artifacts import MIB, evidence_digest
 from divergence.models import Comparison, Scenario, load_trace, safe_child
 from divergence.oracle import compare
 from divergence.process import run_command
@@ -35,17 +36,6 @@ def runner_fingerprint() -> str:
             digest.update(f"{package}={importlib.metadata.version(package)}".encode())
         except importlib.metadata.PackageNotFoundError:
             pass
-    return digest.hexdigest()
-
-
-def evidence_digest(directory: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(directory.rglob("*")):
-        if path.is_file() and path.suffix.lower() in {".json", ".png", ".jpg", ".jpeg"}:
-            if not path.resolve().is_relative_to(directory.resolve()):
-                raise ValueError("evidence symlink escapes the capture")
-            digest.update(path.relative_to(directory).as_posix().encode())
-            digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -104,6 +94,13 @@ class Search:
     def persist(self):
         atomic_json(self.output / "run.json", self.state)
 
+    def capture_digest(self, directory: Path) -> str:
+        return evidence_digest(
+            directory,
+            max_bytes=self.scenario.capture_limits.max_mb * MIB,
+            max_entries=self.scenario.capture_limits.max_entries,
+        )
+
     def trial(self, index: int) -> dict:
         revision = self.history[index]
         previous_attempts = []
@@ -115,7 +112,7 @@ class Search:
             for attempt_result in previous_attempts:
                 for item in attempt_result["captures"]:
                     folder = safe_child(self.output, item["path"])
-                    if evidence_digest(folder) != item["digest"]:
+                    if self.capture_digest(folder) != item["digest"]:
                         raise ValueError(
                             "saved evidence changed; start a new run rather than reusing it"
                         )
@@ -159,7 +156,7 @@ class Search:
                 captures.append(
                     {
                         "path": folder.relative_to(self.output).as_posix(),
-                        "digest": evidence_digest(folder),
+                        "digest": self.capture_digest(folder),
                     }
                 )
                 ref_dir = self.reference or (self.output / captures[0]["path"])

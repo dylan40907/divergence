@@ -93,6 +93,11 @@ class Policy(Contract):
     persistence: int = Field(default=2, ge=1, le=100)
 
 
+class CaptureLimits(Contract):
+    max_mb: int = Field(default=512, ge=1, le=16384)
+    max_entries: int = Field(default=20000, ge=2, le=100000)
+
+
 class Scenario(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(min_length=1, max_length=120)
@@ -101,6 +106,7 @@ class Scenario(Contract):
     duration_ms: int = Field(default=10000, ge=100, le=300000)
     sample_ms: int = Field(default=100, ge=16, le=10000)
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    capture_limits: CaptureLimits = Field(default_factory=CaptureLimits)
     repeats: int = Field(default=2, ge=2, le=10)
     build: list[list[str]] = Field(default_factory=list)
     command: list[str] = Field(default_factory=list)
@@ -165,6 +171,13 @@ class Trace(Contract):
         return self
 
     def validate_for(self, scenario: Scenario, artifact_dir: Path) -> None:
+        from divergence.artifacts import MIB, inspect_artifacts
+
+        inspect_artifacts(
+            artifact_dir,
+            max_bytes=scenario.capture_limits.max_mb * MIB,
+            max_entries=scenario.capture_limits.max_entries,
+        )
         if self.seed != scenario.seed:
             raise ValueError("trace seed does not match the scenario")
         expected = list(range(0, scenario.duration_ms + 1, scenario.sample_ms))

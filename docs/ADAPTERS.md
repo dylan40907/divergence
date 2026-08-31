@@ -91,6 +91,25 @@ logs, configured command timeouts. These are not a hostile-code sandbox. Build s
 fresh repeat checkout with individual timeouts. Capture timeout covers browser startup/teardown.
 Checkouts are removed after trials; logs, frames, traces and the private clone remain.
 
+Capture storage is bounded separately for each repeat:
+
+```yaml
+capture_limits:
+  max_mb: 512
+  max_entries: 20000
+```
+
+Sizes use MiB (1,048,576 bytes). All files count, including video, logs, and temporary files;
+directories count toward the entry limit. Command and browser workers are checked approximately
+every half second and again after exit, so fast-exiting writers are checked too. These are polling
+guardrails, not hard disk quotas: a burst of writes can exceed the threshold before termination.
+Limits apply per capture, not to the whole investigation, build directory, or machine. Completed
+captures are checked again for comparison, resume, and report generation. Links, junctions, and
+non-regular files are rejected rather than followed. No captured files are silently deleted.
+
+Evidence hashes include all capture files, including logs and video, using 1 MiB read chunks.
+Changing these limits changes the scenario fingerprint; start a new investigation after a change.
+
 Timeout cleanup uses Windows `taskkill /T` or a POSIX process group. If the operating system denies
 tree cleanup, the runner attempts to stop its launcher through the existing process handle and
 reports that descendant cleanup could not be confirmed. Do not ignore that diagnostic: descendants
@@ -155,6 +174,11 @@ External network requests are blocked by default. This is not a comprehensive We
 policy. Static builds and mocked dependencies work well; arbitrary backend lifecycle and cross-origin
 navigation are not automated. Browser console errors/warnings join the trace. PNG frames follow
 scenario time; WebM follows wall time.
+
+Browser setup failures identify the stage (`reset_expression`, `state_expression`, snapshot, action,
+navigation, or launch) and scenario time where applicable. A bounded `diagnostic.json` and the full
+`process.log` remain in the failed capture directory. The CLI/report surfaces that diagnostic; it
+does not treat a missing hook, invalid snapshot, or missing selector as a behavioral regression.
 
 Recording supports a single document, ordinary text/number inputs, textarea, clicks, and selected
 keys. Enter/Space button activation is captured once; text spaces are represented by the resulting
