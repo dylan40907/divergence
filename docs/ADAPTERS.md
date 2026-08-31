@@ -7,6 +7,33 @@ Other executable paths should be absolute or on PATH. Commands run at the checko
 
 ## Check a scenario before searching
 
+Create a starter with `divergence init`. This does not inspect your repository, execute commands,
+install dependencies, or overwrite a file. Initialization can run before a repository exists.
+
+```sh
+# Command protocol; everything after -- is preserved as one argv list.
+divergence init --adapter command --name "Open the door" --output scenario.yaml -- "{python}" tools/capture.py
+# Plain DOM app served from the committed checkout (or from a build step's output).
+divergence init --adapter browser --entry dist/index.html --output browser.yaml
+```
+
+PowerShell users can use these commands on one line; quote `"{python}"` so PowerShell treats it as a
+literal placeholder. Starters default to 5 seconds, 250 ms samples, and two repeats. `--duration-ms`
+must be divisible by `--sample-ms`. Browser entries are relative file paths, not remote URLs.
+The browser adapter serves files; it does not start a dev server/backend. Build your app into static
+files first (or configure trusted `build` commands), and use relative asset URLs in that output.
+
+The initial browser snapshot reads `document.title` and visible body text without assuming a
+`window.divergence` hook. You can provide `--state-expression`, edit the YAML for structured fields,
+or use `divergence record` to record actions with the starter as a template. An empty action list
+only observes the page; it does not explore the UI. Text, screenshots, logs and recorded values may
+contain sensitive data. No automatic redaction is promised.
+
+Every starter has `assertions: []` and `policy.mode: difference`. It can check repeatability but
+cannot decide whether the repeated behavior is correct. Add your actual expected behavior, for
+example an invariant about a total, door collider, or final state, then select `assertions` mode.
+Do not simply use an observed value as the expected value unless it expresses the requirement.
+
 1. Run `divergence validate scenario.yaml` to check configuration without executing application code.
 2. Run `divergence verify --repo /path/to/repository --revision HEAD --scenario scenario.yaml`.
    This executes the committed revision in fresh private checkouts, once per configured repeat.

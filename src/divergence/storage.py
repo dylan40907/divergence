@@ -3,8 +3,24 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+
+def _retry_windows_access(operation: Callable[[], None]) -> None:
+    """Allow brief file-handle contention without weakening permissions or atomicity."""
+    for attempt in range(8):
+        try:
+            operation()
+            return
+        except PermissionError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 7:
+                raise
+            # Windows readers may temporarily deny replacement/deletion. Never fall
+            # back to overwriting a live manifest; permanent denial still propagates.
+            time.sleep(min(0.025 * 2**attempt, 0.2))
 
 
 def atomic_json(path: Path, value: Any) -> None:
@@ -14,7 +30,7 @@ def atomic_json(path: Path, value: Any) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, indent=2, ensure_ascii=False, allow_nan=False)
             stream.write("\n")
-        os.replace(temporary, path)
+        _retry_windows_access(lambda: os.replace(temporary, path))
     finally:
         if Path(temporary).exists():
-            Path(temporary).unlink()
+            _retry_windows_access(lambda: Path(temporary).unlink())

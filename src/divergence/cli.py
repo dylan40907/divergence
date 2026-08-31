@@ -135,6 +135,63 @@ def validate(scenario: Annotated[Path, typer.Argument(exists=True, dir_okay=Fals
 
 
 @app.command()
+def init(
+    command: Annotated[
+        list[str] | None,
+        typer.Argument(help="For command adapters, pass a trace-producing argv after --."),
+    ] = None,
+    adapter: Annotated[str, typer.Option(help="command or browser")] = "command",
+    output: Annotated[
+        Path, typer.Option(help="New scenario YAML path; never overwrites an existing file.")
+    ] = Path("divergence.yaml"),
+    name: Annotated[str, typer.Option(help="Name shown in reports.")] = "My scenario",
+    entry: Annotated[
+        str, typer.Option(help="Browser entry file relative to the committed checkout.")
+    ] = "index.html",
+    state_expression: Annotated[
+        str | None,
+        typer.Option(help="Browser snapshot expression; defaults to title and visible text."),
+    ] = None,
+    duration_ms: Annotated[int, typer.Option(min=100, max=300000)] = 5000,
+    sample_ms: Annotated[int, typer.Option(min=16, max=10000)] = 250,
+):
+    """Write a scenario starter without executing code or installing dependencies."""
+    from divergence.onboarding import create_scenario
+
+    try:
+        create_scenario(
+            output,
+            adapter=adapter,
+            command=command,
+            name=name,
+            entry=entry,
+            state_expression=state_expression,
+            duration_ms=duration_ms,
+            sample_ms=sample_ms,
+        )
+    except (ValueError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(2) from exc
+    console.print(f"Created: {output.resolve()}", style="green", markup=False)
+    console.print(
+        "Repeatability only: no behavioral assertions or replay actions were inferred. "
+        "Add the behavior you want checked before using this to judge regressions.",
+        style="yellow",
+    )
+    if adapter == "command":
+        console.print(
+            "The command must write a Divergence trace; wrapping an arbitrary app is not enough."
+        )
+    else:
+        console.print(
+            "The browser serves local static files. Customize snapshots/actions; captured text and images may contain secrets."
+        )
+    console.print(
+        "Next: review the YAML, validate it, then verify a committed revision. Nothing was executed."
+    )
+
+
+@app.command()
 def verify(
     scenario: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")

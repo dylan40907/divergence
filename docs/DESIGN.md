@@ -42,6 +42,13 @@ Skip unusable revisions, search the remaining interval, and report all possible 
 if skips prevent a unique answer. Persist run metadata and trial results atomically. Cache keys
 include scenario digest, source identity, runner version, and reference; never reuse partial trials.
 
+Manifest writes replace a complete temporary JSON file atomically. Windows access/sharing conflicts
+receive up to eight attempts with bounded backoff (less than one second of total waiting per operation).
+Persistent denial still raises an error; the writer never falls back to changing a live manifest in
+place, adjusts permissions, or disables file locks. Tests hold a real Windows reader without delete
+sharing to reproduce blocked replacement and verify both recovery and preservation of the prior JSON.
+[Microsoft documents that delete sharing also governs rename access](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
 Opt-in recovery retries only execution failures. All completed evidence from previous attempts is
 retained, integrity checked, and compared with fresh captures. A later runtime failure cannot erase
 disagreement in an incomplete set of repeats. Once conflicting behavior is observed, repeated
