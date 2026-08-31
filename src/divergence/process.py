@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from divergence.artifacts import MIB, inspect_artifacts
@@ -16,9 +17,14 @@ class ExecutionError(RuntimeError):
     pass
 
 
-def stop_process(process: subprocess.Popen) -> str | None:
+def stop_process(process: subprocess.Popen, job=None) -> str | None:
     warnings = []
-    if os.name == "nt":
+    if job is not None:
+        try:
+            job.terminate()
+        except OSError as exc:
+            warnings.append(f"Windows job cleanup failed: {exc}")
+    elif os.name == "nt":
         # taskkill /T terminates children as well as the launcher.
         try:
             result = subprocess.run(
@@ -87,9 +93,16 @@ def run_command(
             )
 
     check_capture()
-    with log.open("wb") as output:
+    if os.name == "nt":
+        from divergence.windows_job import WindowsJob
+
+        lifecycle = WindowsJob()
+    else:
+        lifecycle = nullcontext()
+    with lifecycle as job, log.open("wb") as output:
         try:
-            process = subprocess.Popen(
+            launch = job.launch if job is not None else subprocess.Popen
+            process = launch(
                 argv,
                 cwd=cwd,
                 env=environment,
@@ -120,15 +133,31 @@ def run_command(
                 except subprocess.TimeoutExpired:
                     continue
         except subprocess.TimeoutExpired as exc:
-            warning = stop_process(process)
+            warning = stop_process(process, job)
             message = f"command timed out after {timeout}s; see {log.name}"
             raise ExecutionError(message + (f"; {warning}" if warning else "")) from exc
         except BaseException as exc:
-            if process.poll() is None:
-                warning = stop_process(process)
+            if process.poll() is None or job is not None:
+                warning = stop_process(process, job)
                 if warning and isinstance(exc, Exception):
                     raise ExecutionError(f"{exc}; {warning}") from exc
             raise
+        if job is not None and not job.wait_empty(0.2):
+            warning = stop_process(process, job)
+            message = "command left background processes running; its process tree was stopped"
+            raise ExecutionError(message + (f"; {warning}" if warning else ""))
+        if os.name != "nt":
+            # The session leader may have exited while other processes kept running.
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                warning = stop_process(process)
+                raise ExecutionError(
+                    "command left background processes running; its process group was stopped"
+                    + (f"; {warning}" if warning else "")
+                )
     if code:
         raise ExecutionError(f"command exited {code}; see {log.name}")
     if log.stat().st_size > 16 * 1024 * 1024:

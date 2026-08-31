@@ -60,6 +60,62 @@ def test_short_lived_oversized_log_is_rejected(tmp_path):
         )
 
 
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_launcher_exit_does_not_leave_descendant_running(tmp_path, exit_code):
+    (tmp_path / "child.py").write_text(
+        "from pathlib import Path; import time\nPath('ready').write_text('yes')\ntime.sleep(2)\nPath('orphan').write_text('unexpected')\n"
+    )
+    (tmp_path / "parent.py").write_text(
+        "import subprocess,sys,time\nfrom pathlib import Path\nsubprocess.Popen([sys.executable,'child.py'])\n"
+        "while not Path('ready').exists(): time.sleep(.01)\n"
+        f"raise SystemExit({exit_code})\n"
+    )
+    with pytest.raises(ExecutionError, match="left background processes"):
+        run_command(["{python}", "parent.py"], tmp_path, 8, tmp_path / "log")
+    assert (tmp_path / "ready").is_file()
+    time.sleep(2.2)
+    assert not (tmp_path / "orphan").exists()
+
+
+def test_process_preserves_nonzero_exit_and_argument_boundaries(tmp_path):
+    (tmp_path / "app.py").write_text("import sys; print(repr(sys.argv[1:])); raise SystemExit(23)")
+    arguments = ["two words", "", 'embedded"quote', "trailing\\", "☃"]
+    with pytest.raises(ExecutionError, match="exited 23"):
+        run_command(["{python}", "app.py", *arguments], tmp_path, 5, tmp_path / "log")
+    import ast
+
+    assert ast.literal_eval((tmp_path / "log").read_text(encoding="utf-8").strip()) == arguments
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job handle lifetime")
+def test_parent_runner_crash_closes_job_and_stops_children(tmp_path):
+    (tmp_path / "child.py").write_text(
+        "from pathlib import Path; import time\nPath('ready').write_text('yes')\ntime.sleep(2)\nPath('orphan').write_text('unexpected')\n"
+    )
+    (tmp_path / "owner.py").write_text("""import os, subprocess, sys, time
+from pathlib import Path
+from divergence.windows_job import WindowsJob
+job=WindowsJob()
+process=job.launch([sys.executable, 'child.py'], creationflags=subprocess.CREATE_NO_WINDOW)
+deadline=time.monotonic()+5
+while not Path('ready').exists():
+    if time.monotonic()>deadline: raise RuntimeError('child did not start')
+    time.sleep(.01)
+os._exit(9)
+""")
+    # This owner intentionally exits without running Python cleanup/finalizers.
+    result = subprocess.run(
+        [sys.executable, "owner.py"],
+        cwd=tmp_path,
+        timeout=8,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    assert result.returncode == 9
+    assert (tmp_path / "ready").is_file()
+    time.sleep(2.2)
+    assert not (tmp_path / "orphan").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows taskkill failure path")
 def test_denied_tree_cleanup_stops_launcher_and_reports_warning(tmp_path, monkeypatch):
     from divergence.process import stop_process

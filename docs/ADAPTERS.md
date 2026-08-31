@@ -110,10 +110,22 @@ non-regular files are rejected rather than followed. No captured files are silen
 Evidence hashes include all capture files, including logs and video, using 1 MiB read chunks.
 Changing these limits changes the scenario fingerprint; start a new investigation after a change.
 
-Timeout cleanup uses Windows `taskkill /T` or a POSIX process group. If the operating system denies
-tree cleanup, the runner attempts to stop its launcher through the existing process handle and
-reports that descendant cleanup could not be confirmed. Do not ignore that diagnostic: descendants
-may remain. Commands which launch detached background work are outside the current lifecycle contract.
+Windows build/capture commands run inside an owned job object. A small isolated Python worker joins the job
+before starting application code, then releases its inherited job handle. The runner retains the
+lifetime handle; closing it also stops descendants, including after the runner exits unexpectedly.
+Timeouts terminate the job and wait for its process count to reach zero. Normal launcher exit is
+also checked: remaining background processes are stopped and reported as an execution failure.
+Failure to establish the job stops execution rather than launching without lifecycle control.
+This supervision covers build/capture subprocesses; Git operations and interactive recording retain
+their separate lifecycles.
+
+POSIX uses a process group, including a check for descendants after launcher exit. Processes that
+deliberately create a separate session, system services, and externally launched work are outside
+that contract. Job objects/process groups control lifetime, not filesystem, credentials, or network
+access. Restricted host policies can still reject process creation or cleanup; do not ignore errors.
+
+Implementation references: [Windows job objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+and [Python handle inheritance](https://docs.python.org/3/library/subprocess.html#subprocess.STARTUPINFO).
 
 Generate evidence from actual runtime logic. The adapter must not read revision labels or demo
 ground truth to classify runs. Divergence owns classification.
