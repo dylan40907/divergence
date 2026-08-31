@@ -79,17 +79,35 @@ class Search:
         progress: Callable[[dict], None] | None = None,
         *,
         audit: bool = False,
+        verify_only: bool = False,
     ):
+        if verify_only and (audit or good != bad):
+            raise ValueError("verification requires one revision and cannot audit history")
         self.output = output.resolve()
         self.provider = GitProvider(repository, self.output)
-        self.history = self.provider.history(good, bad)
+        self.history = (
+            [self.provider.resolve(good)] if verify_only else self.provider.history(good, bad)
+        )
         self.scenario = scenario
         self.progress = progress or (lambda event: None)
         self.reference: Path | None = None
         self.state: dict = {}
         self.audit = audit
+        self.verify_only = verify_only
         self.retry_inconclusive = False
         self.retried: set[str] = set()
+
+    @classmethod
+    def for_verification(
+        cls,
+        repository: Path,
+        revision: str,
+        scenario: Scenario,
+        output: Path,
+        progress: Callable[[dict], None] | None = None,
+    ) -> Search:
+        """Exercise one committed revision without requiring a regression interval."""
+        return cls(repository, revision, revision, scenario, output, progress, verify_only=True)
 
     def persist(self):
         atomic_json(self.output / "run.json", self.state)
@@ -182,9 +200,21 @@ class Search:
             verdict = "INCONCLUSIVE"
         else:
             verdict = next(iter(verdicts))
+        display_index = min(1, len(comparisons) - 1) if self.verify_only and comparisons else 0
+        if self.verify_only and len(comparisons) > 1:
+            display_index = next(
+                (index for index, item in enumerate(comparisons[1:], 1) if item.verdict != "GOOD"),
+                1,
+            )
+        display_comparison = (
+            comparisons[display_index] if comparisons else Comparison(verdict="INCONCLUSIVE")
+        )
+        comparison_basis = "reference" if self.reference else "self"
+        if self.verify_only and display_index > 0:
+            comparison_basis = "repeat"
         if len(captures) > 1:
             first = self.output / captures[0]["path"]
-            for capture in captures[1:]:
+            for capture_index, capture in enumerate(captures[1:], start=1):
                 second = self.output / capture["path"]
                 stable = compare(
                     load_trace(first / "trace.json"),
@@ -198,6 +228,10 @@ class Search:
                     verdict = "INCONCLUSIVE"
                     semantic_uncertainty = True
                     errors.append("repeated executions are unstable under the comparison policy")
+                    if self.verify_only:
+                        display_index = capture_index
+                        display_comparison = stable
+                        comparison_basis = "repeatability"
                     break
         # A retry must not erase previously observed behavior. Even incomplete
         # attempts retain their captures and must agree with the fresh execution.
@@ -228,9 +262,9 @@ class Search:
             "verdict": verdict,
             "seconds": round(time.monotonic() - started, 3),
             "captures": captures,
-            "comparison": comparisons[0].model_dump()
-            if comparisons
-            else Comparison(verdict="INCONCLUSIVE").model_dump(),
+            "comparison": display_comparison.model_dump(),
+            "comparison_capture_index": display_index,
+            "comparison_basis": comparison_basis,
             "repeat_verdicts": [comparison.verdict for comparison in comparisons],
             "errors": errors,
             "retryable": verdict == "INCONCLUSIVE"
@@ -261,6 +295,7 @@ class Search:
             "good": self.history[0],
             "bad": self.history[-1],
             "audit": self.audit,
+            "mode": "verify" if self.verify_only else "bisect",
         }
         manifest = self.output / "run.json"
         if manifest.exists():
@@ -283,13 +318,22 @@ class Search:
                 "history": [self.provider.describe(sha) for sha in self.history],
                 "trials": {},
                 "status": "RUNNING",
-                "scope": "first-parent",
+                "scope": "single-revision" if self.verify_only else "first-parent",
                 "candidates": [],
-                "limitations": [
-                    "Assumes the tested regression remains present after introduction.",
-                    "Source ranking is correlation, not proof of causation.",
-                    f"Observed divergence is sampled every {self.scenario.sample_ms} ms.",
-                ],
+                "limitations": (
+                    [
+                        "Checks one committed revision, not uncommitted work or regression history.",
+                        "Repeatability is measured under configured tolerances and ignores; it is not proof of determinism.",
+                        "Passing covers only this scenario and its enforced assertions, not general application correctness.",
+                        f"Observations are sampled every {self.scenario.sample_ms} ms.",
+                    ]
+                    if self.verify_only
+                    else [
+                        "Assumes the tested regression remains present after introduction.",
+                        "Source ranking is correlation, not proof of causation.",
+                        f"Observed divergence is sampled every {self.scenario.sample_ms} ms.",
+                    ]
+                ),
             }
         self.provider.prepare()
         for key in (
@@ -307,6 +351,29 @@ class Search:
         self.persist()
         try:
             baseline = self.trial(0)
+            if self.verify_only:
+                if baseline["verdict"] == "INCONCLUSIVE":
+                    return self.finish(
+                        "INCONCLUSIVE",
+                        "Could not verify the scenario. Review execution diagnostics and repeatability evidence.",
+                    )
+                if baseline["verdict"] == "BAD":
+                    return self.finish(
+                        "CHECK_FAILED",
+                        "Repeated executions completed consistently, but the configured oracle rejected this revision.",
+                    )
+                enforced = (
+                    bool(self.scenario.assertions) and self.scenario.policy.mode != "difference"
+                )
+                return self.finish(
+                    "VERIFIED",
+                    "Repeated executions agree under the configured comparison policy. "
+                    + (
+                        "Configured assertions passed."
+                        if enforced
+                        else "No behavioral assertions were enforced."
+                    ),
+                )
             if baseline["verdict"] != "GOOD":
                 return self.finish(
                     "INVALID_BASELINE", "Known-good revision must pass and reproduce consistently."
@@ -391,7 +458,7 @@ class Search:
             self.finish("INTERRUPTED", "Interrupted; rerun the same command with --resume.")
             raise
         except Exception as exc:
-            self.finish("FAILED", f"Search stopped without a verdict: {exc}")
+            self.finish("FAILED", f"Run stopped without a verdict: {exc}")
             raise
 
     def finish(self, status: str, message: str) -> dict:

@@ -5,6 +5,28 @@ Commands are argv arrays, never shell strings. `{python}` resolves to the curren
 Other executable paths should be absolute or on PATH. Commands run at the checkout root; pipes,
 `&&`, `$()`, and shell variables are not evaluated. Use a script for complex build logic.
 
+## Check a scenario before searching
+
+1. Run `divergence validate scenario.yaml` to check configuration without executing application code.
+2. Run `divergence verify --repo /path/to/repository --revision HEAD --scenario scenario.yaml`.
+   This executes the committed revision in fresh private checkouts, once per configured repeat.
+   It checks trace shape/cadence, assertion outcomes, and repeated-execution consistency.
+3. Inspect the report's Overview, State & events, and Executions tabs. A failing command or missing
+   browser selector is a setup diagnostic, not a regression verdict. An unstable replay is inconclusive;
+   correct the scenario or deliberately configure tolerances before starting a new verification run.
+4. Once a known-good revision verifies, use `bisect` with good/bad revisions. Bisection independently
+   validates both endpoints; verification captures are not imported into another run's cache.
+
+`verify` never tests uncommitted source changes. It also does not infer assertions or install missing
+dependencies. The portable verification report shows replay 1 versus replay 2, or the later replay
+that exposed instability. If only one capture completes, it is shown without a reference; no capture
+is presented as an independent comparison with itself. Earlier retry attempts remain in the ledger.
+The raw trace/frame files for every completed repeat remain in the run folder.
+
+Verification is conditional on the scenario, seed, ignores, and tolerances. A passing difference-only
+check says the sampled behavior repeats under that policy; it says nothing about whether that behavior
+is correct. `capture` remains available for one raw execution without a repeated-run verdict.
+
 ## Command scenario
 
 ```yaml

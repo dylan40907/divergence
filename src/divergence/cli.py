@@ -59,6 +59,7 @@ def execute_search(
     model: Path | None = None,
     audit: bool = False,
     retry_inconclusive: bool = False,
+    verify_only: bool = False,
 ) -> dict:
     from divergence.engine import Search
     from divergence.report import render_report
@@ -73,7 +74,9 @@ def execute_search(
         "Running trusted application code in disposable checkouts. This is not a security sandbox.",
         style="dim",
     )
-    search = Search(repository, good, bad, config, output, progress, audit=audit)
+    search = Search(
+        repository, good, bad, config, output, progress, audit=audit, verify_only=verify_only
+    )
     result = search.run(resume=resume, retry_inconclusive=retry_inconclusive)
     report = render_report(output)
     console.print(f"\n{result['status']}: {result['message']}", style="bold", markup=False)
@@ -129,6 +132,49 @@ def validate(scenario: Annotated[Path, typer.Argument(exists=True, dir_okay=Fals
         console.print(str(exc), style="red", markup=False)
         raise typer.Exit(2) from exc
     console.print(f"Valid: {config.name}\nScenario digest: {config.digest}", markup=False)
+
+
+@app.command()
+def verify(
+    scenario: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")
+    ],
+    revision: Annotated[
+        str, typer.Option(help="Committed Git revision to replay; excludes uncommitted work.")
+    ] = "HEAD",
+    repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("."),
+    output: Annotated[
+        Path | None, typer.Option(help="Run directory (new unless --resume).")
+    ] = None,
+    resume: Annotated[
+        bool, typer.Option(help="Reuse validated completed evidence in --output.")
+    ] = False,
+    retry_inconclusive: Annotated[
+        bool,
+        typer.Option(
+            help="With --resume, retry execution failures once, retaining prior evidence."
+        ),
+    ] = False,
+):
+    """Check replay, assertions, and repeatability at one revision. Executes trusted code."""
+    if resume and output is None:
+        console.print("--resume requires the original --output directory", style="red")
+        raise typer.Exit(2)
+    try:
+        result = execute_search(
+            repo,
+            revision,
+            revision,
+            scenario,
+            output or fresh_output(),
+            resume=resume,
+            retry_inconclusive=retry_inconclusive,
+            verify_only=True,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(2) from exc
+    raise typer.Exit(0 if result["status"] == "VERIFIED" else 3)
 
 
 @app.command()
