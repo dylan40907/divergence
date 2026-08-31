@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
+import json
+import re
 import tarfile
 import tomllib
 import zipfile
@@ -13,6 +16,38 @@ from pathlib import Path, PurePosixPath
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def distribution_sample(report: bytes) -> bytes:
+    """Create a labeled copy of the synthetic cart report without the host repository path.
+
+    This is deliberately not a general-purpose redactor for private application evidence.
+    Original captures, recorded digests, and the original report are never modified.
+    """
+    html = report.decode("utf-8")
+    marker = re.search(r"atob\('([A-Za-z0-9+/=]+)'\)", html)
+    if not marker:
+        raise ValueError("sample is not a rendered report")
+    payload = json.loads(base64.b64decode(marker.group(1)))
+    run = payload["run"]
+    if (
+        run["scenario"]["name"] != "Fieldwork · a coupon applies only once"
+        or run["scenario"]["adapter"] != "browser"
+        or any(row["author"] != "Divergence Demo" for row in run["history"])
+        or run["status"] != "FOUND"
+    ):
+        raise ValueError(
+            "distribution sample must be the qualified synthetic cart demo; review real reports separately"
+        )
+    run["identity"]["repository"] = "generated-cart-repository"
+    run["limitations"].append(
+        "Distribution sample: host repository path removed. Captured content and evidence digests are unchanged."
+    )
+    serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    if re.search(r"\b[A-Za-z]:[\\/]|/(?:Users|home|tmp|private|var|mnt|Volumes)/", serialized):
+        raise ValueError("sample still contains a host path; review before distributing")
+    encoded = base64.b64encode(serialized.encode()).decode()
+    return (html[: marker.start(1)] + encoded + html[marker.end(1) :]).encode("utf-8")
 
 
 def package(root: Path, sample_report: Path) -> Path:
@@ -56,6 +91,7 @@ def package(root: Path, sample_report: Path) -> Path:
         "SECURITY.md",
         "CONTRIBUTING.md",
         "requirements-dev-py312.lock",
+        "requirements-dev-py311.lock",
         "docs/ADAPTERS.md",
         "docs/DESIGN.md",
         "docs/EVALUATION.md",
@@ -63,13 +99,13 @@ def package(root: Path, sample_report: Path) -> Path:
         "docs/RELEASE_CHECKLIST.md",
         "docs/RELEASING.md",
         "docs/DEPENDENCIES.md",
+        "docs/EXTERNAL_VALIDATION.md",
+        "docs/PUBLIC_RELEASE.md",
+        "docs/BACKUP.md",
         "docs/assets/report.png",
     ]:
         payload[name] = (root / name).read_bytes()
-    report = sample_report.read_bytes()
-    if b"__DIVERGENCE_DATA__" in report or b"atob('" not in report:
-        raise ValueError("sample is not a rendered report")
-    payload["examples/cart-report.html"] = report
+    payload["examples/cart-report.html"] = distribution_sample(sample_report.read_bytes())
     payload["SHA256SUMS.txt"] = "".join(
         f"{sha256(data)}  {name}\n" for name, data in sorted(payload.items())
     ).encode()

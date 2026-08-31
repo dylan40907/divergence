@@ -1,7 +1,12 @@
+import base64
+import json
+import re
+
 import pytest
 from packaging.version import Version
 
 from tools.audit_dependencies import includes
+from tools.package_release import distribution_sample
 
 
 def test_osv_range_boundaries_and_unordered_events():
@@ -47,3 +52,40 @@ def test_osv_explicit_versions_and_unknown_coverage():
     assert not includes(
         Version("2.0"), {"versions": ["0.3.2d", "1.0"], "ranges": [{"type": "GIT", "events": []}]}
     )
+
+
+def test_distribution_sample_removes_only_host_identity_and_rejects_other_paths():
+    payload = {
+        "run": {
+            "scenario": {"name": "Fieldwork · a coupon applies only once", "adapter": "browser"},
+            "history": [{"author": "Divergence Demo"}],
+            "status": "FOUND",
+            "identity": {"repository": "C:/Users/example/demo"},
+            "limitations": [],
+            "trials": {"sample": {"captures": [{"path": "trials/capture", "digest": "abc"}]}},
+        },
+        "traces": {"sample": {"samples": [{"state": {"total_cents": 4050}}]}},
+        "integrity": {"checked_captures": 2},
+    }
+
+    def encode():
+        return (
+            "<script>atob('"
+            + base64.b64encode(json.dumps(payload).encode()).decode()
+            + "')</script>"
+        ).encode()
+
+    original = encode()
+    result = distribution_sample(original)
+    exported = json.loads(base64.b64decode(re.search(rb"atob\('([^']+)'\)", result).group(1)))
+    assert original == encode()
+    assert exported["run"]["identity"]["repository"] == "generated-cart-repository"
+    assert exported["traces"] == payload["traces"]
+    assert exported["run"]["trials"] == payload["run"]["trials"]
+    assert exported["integrity"] == payload["integrity"]
+    payload["traces"]["sample"]["diagnostic"] = "/home/private-user/evidence"
+    with pytest.raises(ValueError, match="host path"):
+        distribution_sample(encode())
+    payload["run"]["scenario"]["name"] = "Private customer application"
+    with pytest.raises(ValueError, match="synthetic cart demo"):
+        distribution_sample(encode())

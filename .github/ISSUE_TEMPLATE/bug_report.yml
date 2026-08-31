@@ -1,0 +1,37 @@
+name: Bug report
+description: Report reproducible behavior in Divergence.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report Divergence behavior, not credentials or private application evidence.
+        Reports may contain screenshots, source, input values, and local paths. Redact before attaching.
+        For security findings, read SECURITY.md first; do not use an ordinary issue for secrets.
+  - type: input
+    id: version
+    attributes:
+      label: Divergence version or commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system, Python version, and adapter
+      placeholder: Windows 11, Python 3.12, browser adapter
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include a small non-sensitive scenario and commands. State whether a bundled demo reproduces it.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Expected and observed outcome
+      description: Include the status, exit code, and relevant redacted diagnostic.
+    validations:
+      required: true
