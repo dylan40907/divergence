@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Divergence · Interlock Lab</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#0e1520;color:#c5d4e7;font:14px system-ui}canvas{display:block;width:960px;height:540px}button{position:absolute;top:28px;right:40px;background:#233748;color:#8aebcc;border:1px solid #456770;border-radius:8px;padding:9px 18px;cursor:pointer}</style></head>
+<body><canvas id="scene" width="960" height="540" aria-label="Door interlock simulation"></canvas><button id="switch">Activate switch</button>
+<script type="module">
+import { Door } from './door.js';
+const canvas=document.querySelector('canvas'), c=canvas.getContext('2d');
+let door, x, clock, events=[];
+const box=(x,y,w,h,color)=>{c.fillStyle=color;c.fillRect(x,y,w,h)};
+function text(s,x,y,size,color){c.font=`${size}px system-ui`;c.fillStyle=color;c.fillText(s,x,y)}
+function render(){
+ box(0,0,960,540,'#0e1520');box(38,92,884,378,'#182334');
+ c.strokeStyle='#223246';c.lineWidth=1;
+ for(let gx=58;gx<920;gx+=32){c.beginPath();c.moveTo(gx,110);c.lineTo(gx,450);c.stroke()}
+ for(let gy=110;gy<450;gy+=32){c.beginPath();c.moveTo(58,gy);c.lineTo(902,gy);c.stroke()}
+ text('SECTOR 07  /  DOOR INTERLOCK',40,48,22,'#c5d4e7');
+ text('DETERMINISTIC TEST ENVIRONMENT',40,73,11,'#778ca7');
+ box(480,94,20,121,'#455670');box(480,335,20,132,'#455670');
+ if(!door.open)box(480,215,20,120,'#f0b66a');else{box(480,205,20,5,'#70dfc0');box(480,340,20,5,'#70dfc0')}
+ box(270,145,43,39,door.open?'#70dfc0':'#465671');text('SWITCH',265,134,12,'#92a8c4');
+ c.strokeStyle='#54778a';c.lineWidth=2;c.beginPath();c.arc(760,275,25,0,Math.PI*2);c.stroke();text('EXIT',745,324,12,'#92a8c4');
+ c.fillStyle='#8f9bff';c.beginPath();c.arc(x,275,18,0,Math.PI*2);c.fill();
+ box(x,273,27,3,'#c4caff');text(`SCENARIO CLOCK    ${(clock/1000).toFixed(2)} s`,40,514,15,'#9aadc8');
+ text(`DOOR: ${door.open?'OPEN':'CLOSED'}`,710,514,15,door.open?'#70dfc0':'#f0b66a');
+}
+function activate(){if(!door.open){door.activate();events.push('DoorOpened');render()}}
+window.divergence={
+ reset(seed){door=new Door();x=140;clock=0;events=[];render()},
+ step(ms){clock+=ms;if(clock>=3500){const target=Math.min(760,x+ms*.11);x=door.collider_enabled?Math.min(455,target):target}render()},
+ snapshot(){const snapshot={state:{door:{open:door.open,collider_enabled:door.collider_enabled},player:{x:Math.round(x*10000)/10000,reached_exit:x>=750},clock_ms:clock},events:[...events],logs:[],metrics:{}};events=[];return snapshot}
+};
+document.querySelector('#switch').addEventListener('click',activate);window.divergence.reset(42);
+</script></body></html>
