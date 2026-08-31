@@ -1,5 +1,9 @@
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -26,6 +30,58 @@ def test_process_timeout(tmp_path):
         run_command(
             ["{python}", "-c", "import time; time.sleep(10)"], tmp_path, 1, tmp_path / "log"
         )
+
+
+def test_timeout_stops_descendant_before_it_can_write(tmp_path):
+    child = tmp_path / "child.py"
+    child.write_text(
+        "from pathlib import Path; import time\nPath('ready').write_text('yes')\ntime.sleep(3)\nPath('orphan').write_text('unexpected')\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\nsubprocess.Popen([sys.executable, 'child.py'])\ntime.sleep(30)\n"
+    )
+    with pytest.raises(ExecutionError, match="timed out"):
+        run_command(["{python}", str(parent)], tmp_path, 2, tmp_path / "log")
+    assert (tmp_path / "ready").is_file(), (
+        "the child must actually start for this test to be meaningful"
+    )
+    time.sleep(2)
+    assert not (tmp_path / "orphan").exists()
+
+
+def test_short_lived_oversized_log_is_rejected(tmp_path):
+    with pytest.raises(ExecutionError, match="exceeded 16 MiB"):
+        run_command(
+            ["{python}", "-c", "import sys; sys.stdout.write('x' * (17 * 1024 * 1024))"],
+            tmp_path,
+            5,
+            tmp_path / "log",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows taskkill failure path")
+def test_denied_tree_cleanup_stops_launcher_and_reports_warning(tmp_path, monkeypatch):
+    from divergence.process import stop_process
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, b"Access denied"),
+    )
+    try:
+        warning = stop_process(process)
+        assert "cleanup could not be confirmed" in warning
+        assert "Access denied" in warning
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 def test_duplicate_run_lock_is_rejected(tmp_path):

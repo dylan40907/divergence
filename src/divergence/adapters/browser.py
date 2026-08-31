@@ -1,4 +1,4 @@
-"""Playwright capture worker for trusted instrumented local web applications."""
+"""Playwright capture worker for trusted local web applications."""
 
 from __future__ import annotations
 
@@ -103,7 +103,13 @@ def capture(source: Path, output: Path, scenario: Scenario) -> None:
                     elif action.kind == "click":
                         page.locator(action.target).click(timeout=5000)
                     elif action.kind == "press":
-                        page.locator(action.target).press(action.value)
+                        target = page.locator(action.target)
+                        # Body is not focusable by default. Without clearing focus,
+                        # Playwright sends a recorded page shortcut to the last input.
+                        target.evaluate(
+                            "element => {if(element === document.body) document.activeElement?.blur()}"
+                        )
+                        target.press(action.value)
                     else:
                         page.locator(action.target).fill(action.value)
                 snapshot = page.evaluate(scenario.browser.state_expression)

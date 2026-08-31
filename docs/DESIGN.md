@@ -22,7 +22,7 @@ ordered samples on scenario time, state, events, logs, metrics, and optional rel
 An assertion says which property makes a run bad; generic differences are used only when explicitly
 enabled. Appearance differences alone do not prove semantic failure.
 
-Adapters: command protocol for any instrumented runtime; Playwright for instrumented web apps;
+Adapters: command protocol for any instrumented runtime; Playwright for DOM-based or instrumented web apps;
 Pygame and Godot examples use the command protocol. Future Perforce work belongs behind the revision
 provider contract, not inside an engine adapter.
 
@@ -41,6 +41,11 @@ Validate good and bad endpoints before searching. Maintain a good lower bound an
 Skip unusable revisions, search the remaining interval, and report all possible boundary commits
 if skips prevent a unique answer. Persist run metadata and trial results atomically. Cache keys
 include scenario digest, source identity, runner version, and reference; never reuse partial trials.
+
+Opt-in recovery retries only execution failures. All completed evidence from previous attempts is
+retained, integrity checked, and compared with fresh captures. A later runtime failure cannot erase
+disagreement in an incomplete set of repeats. Once conflicting behavior is observed, repeated
+selection of favorable runs cannot turn that same investigation into a confident boundary.
 
 ## ML
 

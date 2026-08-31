@@ -14,22 +14,42 @@ class ExecutionError(RuntimeError):
     pass
 
 
-def stop_process(process: subprocess.Popen) -> None:
+def stop_process(process: subprocess.Popen) -> str | None:
+    warnings = []
     if os.name == "nt":
         # taskkill /T terminates children as well as the launcher.
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                diagnostic = result.stdout.decode(errors="replace").strip()[:500]
+                warnings.append(
+                    f"process-tree cleanup could not be confirmed: {diagnostic or 'taskkill failed'}"
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warnings.append(f"process-tree cleanup could not be confirmed: {exc}")
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    process.wait(timeout=10)
+        except OSError as exc:
+            warnings.append(f"process-group cleanup failed: {exc}")
+    # Use our existing process handle if enumeration/termination of the whole
+    # tree is denied. This only guarantees stopping the launcher; say so.
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        warnings.append(f"launcher cleanup failed: {exc}")
+    return "; ".join(warnings) or None
 
 
 def run_command(
@@ -75,7 +95,6 @@ def run_command(
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv, timeout)
                 if log.stat().st_size > 16 * 1024 * 1024:
-                    stop_process(process)
                     raise ExecutionError(f"command log exceeded 16 MiB; see {log.name}")
                 try:
                     code = process.wait(timeout=min(0.25, remaining))
@@ -83,11 +102,14 @@ def run_command(
                 except subprocess.TimeoutExpired:
                     continue
         except subprocess.TimeoutExpired as exc:
-            stop_process(process)
-            raise ExecutionError(f"command timed out after {timeout}s; see {log.name}") from exc
-        except BaseException:
+            warning = stop_process(process)
+            message = f"command timed out after {timeout}s; see {log.name}"
+            raise ExecutionError(message + (f"; {warning}" if warning else "")) from exc
+        except BaseException as exc:
             if process.poll() is None:
-                stop_process(process)
+                warning = stop_process(process)
+                if warning and isinstance(exc, Exception):
+                    raise ExecutionError(f"{exc}; {warning}") from exc
             raise
     if code:
         raise ExecutionError(f"command exited {code}; see {log.name}")

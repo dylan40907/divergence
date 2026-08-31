@@ -17,32 +17,50 @@ from divergence.models import Action, Scenario, safe_child
 RECORDER_SCRIPT = r"""(() => {
   window.__divergenceRecorded = [];
   window.__divergenceTick = 0;
+  const unique = (query, element) => {
+    const matches = document.querySelectorAll(query);
+    return matches.length === 1 && matches[0] === element;
+  };
   const selector = element => {
-    if (element.id) return '#' + CSS.escape(element.id);
-    if (element.hasAttribute('data-testid')) return '[data-testid="' + CSS.escape(element.getAttribute('data-testid')) + '"]';
-    if (element.name) return element.tagName.toLowerCase()+'[name="'+CSS.escape(element.name)+'"]';
+    const candidates=[];
+    if(element.id) candidates.push('#'+CSS.escape(element.id));
+    if(element.hasAttribute('data-testid')) candidates.push('[data-testid="'+CSS.escape(element.getAttribute('data-testid'))+'"]');
+    if(element.name) candidates.push(element.tagName.toLowerCase()+'[name="'+CSS.escape(element.name)+'"]');
+    for(const candidate of candidates) if(unique(candidate,element)) return candidate;
     const path=[];
-    while(element && element.nodeType===1 && element!==document.body) {
+    while(element && element.nodeType===1) {
       const tag=element.tagName.toLowerCase(); let index=1, sibling=element.previousElementSibling;
       while(sibling){if(sibling.tagName===element.tagName) index++; sibling=sibling.previousElementSibling;}
       path.unshift(tag+':nth-of-type('+index+')'); element=element.parentElement;
     }
-    return 'body > '+path.join(' > ');
+    return path.join(' > ');
+  };
+  const privateField = element => {
+    if(element.closest('[data-divergence-private],input[type="password"]')) return true;
+    const tokens=(element.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
+    return tokens.some(token => token.startsWith('cc-') || ['current-password','new-password','one-time-code'].includes(token));
   };
   const push=(kind,element,value='')=>window.__divergenceRecorded.push({at_ms:window.__divergenceTick,kind,target:selector(element),value});
   document.addEventListener('click',event=>{
-    if(!event.isTrusted || event.detail===0)return;
+    if(!event.isTrusted || event.detail===0 || privateField(event.target))return;
     const target=event.target.closest('button,a,input[type=checkbox],input[type=radio],[role=button]');
     if(target)push('click',target);
   },true);
   document.addEventListener('input',event=>{
-    if(!event.isTrusted)return;
+    if(!event.isTrusted || privateField(event.target))return;
     const target=event.target;
     if((target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
        !['password','checkbox','radio','file','hidden','range','color'].includes(target.type))push('fill',target,target.value);
   },true);
   document.addEventListener('keydown',event=>{
-    if(!event.isTrusted)return;
+    if(!event.isTrusted || privateField(event.target))return;
+    const target=event.target;
+    const editable=target.isContentEditable || target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLInputElement && !['button','submit','reset','checkbox','radio','range','color','file','hidden'].includes(target.type));
+    // Text is represented by its resulting value. Replaying Space as well would
+    // emit an extra input event; cursor movements are already reflected in fills.
+    if(editable && (event.key===' ' || event.key.startsWith('Arrow')))return;
+    if(event.key==='Enter' && (target instanceof HTMLTextAreaElement || target.isContentEditable))return;
     if(['Enter','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(event.key))push('press',event.target,event.key===' '?'Space':event.key);
   },true);
 })();"""

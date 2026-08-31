@@ -58,6 +58,7 @@ def execute_search(
     resume: bool = False,
     model: Path | None = None,
     audit: bool = False,
+    retry_inconclusive: bool = False,
 ) -> dict:
     from divergence.engine import Search
     from divergence.report import render_report
@@ -73,7 +74,7 @@ def execute_search(
         style="dim",
     )
     search = Search(repository, good, bad, config, output, progress, audit=audit)
-    result = search.run(resume=resume)
+    result = search.run(resume=resume, retry_inconclusive=retry_inconclusive)
     report = render_report(output)
     console.print(f"\n{result['status']}: {result['message']}", style="bold", markup=False)
     if result.get("culprit"):
@@ -144,6 +145,12 @@ def bisect(
     resume: Annotated[
         bool, typer.Option(help="Reuse validated completed trials in --output.")
     ] = False,
+    retry_inconclusive: Annotated[
+        bool,
+        typer.Option(
+            help="With --resume, retry execution failures once, retaining prior evidence. Unstable results are not retried."
+        ),
+    ] = False,
     model: Annotated[
         Path | None,
         typer.Option(
@@ -165,7 +172,15 @@ def bisect(
         raise typer.Exit(2)
     try:
         result = execute_search(
-            repo, good, bad, scenario, output or fresh_output(), resume, model, audit
+            repo,
+            good,
+            bad,
+            scenario,
+            output or fresh_output(),
+            resume,
+            model,
+            audit,
+            retry_inconclusive,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(str(exc), style="red", markup=False)
@@ -181,6 +196,7 @@ def demo(
     commits: Annotated[int, typer.Option(min=2, max=512)] = 128,
     bug_at: Annotated[int, typer.Option(min=2, help="1-based bug introduction commit.")] = 83,
     adapter: Annotated[str, typer.Option(help="command, browser, pygame, or godot")] = "command",
+    fixture: Annotated[str, typer.Option(help="interlock or cart (browser only)")] = "interlock",
     godot: Annotated[
         str, typer.Option(help="Godot executable path for --adapter godot.")
     ] = "godot",
@@ -188,7 +204,7 @@ def demo(
         bool, typer.Option("--run", help="Immediately bisect the generated history.")
     ] = False,
 ):
-    """Create an instrumented simulation with a real, intentionally regressed Git history."""
+    """Create a local fixture with a real, intentionally regressed Git history."""
     from divergence.demo import create_demo
 
     if adapter not in {"command", "browser", "pygame", "godot"}:
@@ -198,7 +214,9 @@ def demo(
         console.print(f"Creating {commits} real commits; bug introduced at revision {bug_at}.")
         if adapter == "godot" and Path(godot).is_file():
             godot = str(Path(godot).resolve())
-        result = create_demo(output, commits=commits, bug_at=bug_at, adapter=adapter, godot=godot)
+        result = create_demo(
+            output, commits=commits, bug_at=bug_at, adapter=adapter, godot=godot, fixture=fixture
+        )
         console.print(
             f"Demo ready: {result['repository']}\nScenario: {result['scenario']}", markup=False
         )

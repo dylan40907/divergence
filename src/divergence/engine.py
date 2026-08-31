@@ -98,23 +98,37 @@ class Search:
         self.reference: Path | None = None
         self.state: dict = {}
         self.audit = audit
+        self.retry_inconclusive = False
+        self.retried: set[str] = set()
 
     def persist(self):
         atomic_json(self.output / "run.json", self.state)
 
     def trial(self, index: int) -> dict:
         revision = self.history[index]
+        previous_attempts = []
         if revision in self.state["trials"]:
             saved = self.state["trials"][revision]
-            for item in saved["captures"]:
-                folder = safe_child(self.output, item["path"])
-                if evidence_digest(folder) != item["digest"]:
-                    raise ValueError(
-                        "saved evidence changed; start a new run rather than reusing it"
-                    )
-                load_trace(folder / "trace.json").validate_for(self.scenario, folder)
-            self.progress({"kind": "cached", **saved})
-            return saved
+            previous_attempts = saved.get("previous_attempts", []) + [
+                {key: value for key, value in saved.items() if key != "previous_attempts"}
+            ]
+            for attempt_result in previous_attempts:
+                for item in attempt_result["captures"]:
+                    folder = safe_child(self.output, item["path"])
+                    if evidence_digest(folder) != item["digest"]:
+                        raise ValueError(
+                            "saved evidence changed; start a new run rather than reusing it"
+                        )
+                    load_trace(folder / "trace.json").validate_for(self.scenario, folder)
+            if not (
+                self.retry_inconclusive
+                and saved.get("retryable", False)
+                and saved["verdict"] == "INCONCLUSIVE"
+                and revision not in self.retried
+            ):
+                self.progress({"kind": "cached", **saved})
+                return saved
+            self.retried.add(revision)
         self.progress(
             {"kind": "testing", "sha": revision, "index": index, "total": len(self.history)}
         )
@@ -122,6 +136,8 @@ class Search:
         captures = []
         comparisons = []
         errors = []
+        execution_failure = False
+        semantic_uncertainty = False
         stage = "checkout"
         attempt = uuid.uuid4().hex[:8]
         for repeat in range(self.scenario.repeats):
@@ -152,6 +168,7 @@ class Search:
                 comparisons.append(compare(reference, trace, self.scenario, ref_dir, folder))
             except (ValueError, RuntimeError, OSError) as exc:
                 errors.append(f"{stage}: {exc}")
+                execution_failure = stage in {"checkout", "build", "capture"}
                 break
             finally:
                 if source is not None:
@@ -159,15 +176,16 @@ class Search:
                         self.provider.release(source)
                     except RuntimeError as exc:
                         errors.append(f"cleanup: {exc}")
+                        semantic_uncertainty = True
         verdicts = {comparison.verdict for comparison in comparisons}
+        if len(verdicts) > 1:
+            semantic_uncertainty = True
+            errors.append("repeated executions disagree on the verdict")
         if errors or len(comparisons) != self.scenario.repeats:
             verdict = "INCONCLUSIVE"
-        elif len(verdicts) != 1:
-            verdict = "INCONCLUSIVE"
-            errors.append("repeated executions disagree on the verdict")
         else:
             verdict = next(iter(verdicts))
-        if len(captures) == self.scenario.repeats:
+        if len(captures) > 1:
             first = self.output / captures[0]["path"]
             for capture in captures[1:]:
                 second = self.output / capture["path"]
@@ -181,8 +199,32 @@ class Search:
                 )
                 if stable.verdict != "GOOD":
                     verdict = "INCONCLUSIVE"
+                    semantic_uncertainty = True
                     errors.append("repeated executions are unstable under the comparison policy")
                     break
+        # A retry must not erase previously observed behavior. Even incomplete
+        # attempts retain their captures and must agree with the fresh execution.
+        if previous_attempts and captures:
+            fresh = self.output / captures[0]["path"]
+            for old in previous_attempts:
+                if set(old["repeat_verdicts"]) | verdicts not in ({"GOOD"}, {"BAD"}):
+                    if old["repeat_verdicts"] and verdicts:
+                        semantic_uncertainty = True
+                for capture in old["captures"]:
+                    prior = self.output / capture["path"]
+                    stable = compare(
+                        load_trace(prior / "trace.json"),
+                        load_trace(fresh / "trace.json"),
+                        self.scenario,
+                        prior,
+                        fresh,
+                        stability=True,
+                    )
+                    if stable.verdict != "GOOD":
+                        semantic_uncertainty = True
+            if semantic_uncertainty:
+                verdict = "INCONCLUSIVE"
+                errors.append("retry disagrees with evidence retained from an earlier attempt")
         result = {
             **self.provider.describe(revision),
             "index": index,
@@ -194,13 +236,23 @@ class Search:
             else Comparison(verdict="INCONCLUSIVE").model_dump(),
             "repeat_verdicts": [comparison.verdict for comparison in comparisons],
             "errors": errors,
+            "retryable": verdict == "INCONCLUSIVE"
+            and execution_failure
+            and not semantic_uncertainty
+            and "INCONCLUSIVE" not in verdicts,
+            "previous_attempts": previous_attempts,
         }
         self.state["trials"][revision] = result
         self.persist()
         self.progress({"kind": "tested", **result})
         return result
 
-    def run(self, *, resume: bool = False) -> dict:
+    def run(self, *, resume: bool = False, retry_inconclusive: bool = False) -> dict:
+        if retry_inconclusive and (not resume or not (self.output / "run.json").is_file()):
+            raise ValueError("--retry-inconclusive requires --resume and an existing run")
+        self.retry_inconclusive = retry_inconclusive
+        self.retried.clear()
+        self.reference = None
         with run_lock(self.output):
             return self._run(resume)
 
@@ -243,6 +295,17 @@ class Search:
                 ],
             }
         self.provider.prepare()
+        for key in (
+            "culprit",
+            "diff",
+            "ranked_changes",
+            "boundary_good",
+            "boundary_bad",
+            "good_after_bad",
+            "message",
+        ):
+            self.state.pop(key, None)
+        self.state["candidates"] = []
         self.state["status"] = "RUNNING"
         self.persist()
         try:
@@ -282,7 +345,7 @@ class Search:
                 for i in range(low + 1, high):
                     trial = self.state["trials"].get(self.history[i])
                     if trial:
-                        self.trial(i)  # Validate cached evidence before using the label.
+                        trial = self.trial(i)  # Validate or retry before using the label.
                         if trial["verdict"] == "GOOD":
                             low = max(low, i)
                         elif trial["verdict"] == "BAD":

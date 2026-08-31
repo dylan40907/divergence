@@ -18,15 +18,24 @@ def create_demo(
     bug_at: int = 83,
     adapter: str = "command",
     godot: str = "godot",
+    fixture: str = "interlock",
 ) -> dict:
     if not 2 <= bug_at <= commits <= 512:
         raise ValueError("require 2 <= bug_at <= commits <= 512")
+    if adapter not in {"command", "browser", "pygame", "godot"}:
+        raise ValueError("unknown demo adapter")
+    if fixture not in {"interlock", "cart"}:
+        raise ValueError("fixture must be interlock or cart")
+    if fixture == "cart" and adapter != "browser":
+        raise ValueError("the cart fixture requires --adapter browser")
     output = output.resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError("demo output must be new or empty; existing files are never overwritten")
     output.mkdir(parents=True, exist_ok=True)
     repository = output / "repository"
     template = adapter if adapter in {"browser", "godot"} else "python"
+    if fixture == "cart":
+        template = "cart"
     shutil.copytree(
         Path(__file__).parent / "demo_templates" / template,
         repository,
@@ -42,11 +51,13 @@ def create_demo(
     culprit = good = ""
     for number in range(1, commits + 1):
         (repository / "evolution.txt").write_text(
-            f"Interlock simulation revision {number}\n", encoding="utf-8"
+            f"{fixture.title()} fixture revision {number}\n", encoding="utf-8"
         )
         if number == bug_at:
             door = repository / (
-                "door.js"
+                "cart.js"
+                if fixture == "cart"
+                else "door.js"
                 if adapter == "browser"
                 else "door.gd"
                 if adapter == "godot"
@@ -60,12 +71,20 @@ def create_demo(
             )
             if adapter == "godot":
                 before, after = "collider_enabled = false", "collider_enabled = true"
+            if fixture == "cart":
+                before, after = "  if (couponApplied) return;\n", ""
+            if code.count(before) != 1:
+                raise ValueError("demo mutation must match exactly once")
             door.write_text(code.replace(before, after), encoding="utf-8")
         git(repository, "add", ".")
         message = (
-            "Refactor door collision handling"
+            (
+                "Simplify coupon application"
+                if fixture == "cart"
+                else "Refactor door collision handling"
+            )
             if number == bug_at
-            else f"Tune interlock lab iteration {number:03d}"
+            else f"Tune {fixture} iteration {number:03d}"
         )
         git(repository, "commit", "-q", "-m", message)
         if number == 1:
@@ -101,7 +120,32 @@ def create_demo(
         ],
         "policy": {"mode": "assertions", "ignore_paths": ["clock_ms"]},
     }
-    if adapter == "browser":
+    if fixture == "cart":
+        scenario.update(
+            name="Fieldwork · a coupon applies only once",
+            duration_ms=2000,
+            assertions=[
+                {
+                    "path": "total_cents",
+                    "op": "eq",
+                    "value": 4500,
+                    "at": "always",
+                    "from_ms": 1000,
+                    "message": "Applying WELCOME10 repeatedly must not stack its discount.",
+                }
+            ],
+            browser={
+                "entry": "index.html",
+                "reset_expression": "() => {}",
+                "state_expression": "({state: {total_cents: Number(document.querySelector('#total').dataset.cents), quantity: Number(document.querySelector('#quantity').value)}})",
+                "actions": [
+                    {"at_ms": 250, "kind": "fill", "target": "#quantity", "value": "2"},
+                    {"at_ms": 1000, "kind": "click", "target": "#apply-coupon"},
+                    {"at_ms": 1500, "kind": "click", "target": "#apply-coupon"},
+                ],
+            },
+        )
+    elif adapter == "browser":
         scenario["browser"] = {
             "entry": "index.html",
             "tick_expression": "ms => window.divergence.step(ms)",
@@ -124,6 +168,7 @@ def create_demo(
         "bug_at": bug_at,
         "commits": commits,
         "adapter": adapter,
+        "fixture": fixture,
     }
     # Ground truth is outside the repository and is never read by the search engine.
     atomic_json(output / "expected.json", result)

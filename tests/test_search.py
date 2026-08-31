@@ -3,6 +3,7 @@ import json
 import pytest
 from conftest import history
 
+from divergence.adapters import CommandAdapter
 from divergence.engine import Search
 from divergence.revisions import GitProvider, RevisionError, git
 
@@ -87,3 +88,117 @@ def test_non_ancestor_is_rejected(tmp_path):
     side = git(repo, "rev-parse", "HEAD")
     with pytest.raises(RevisionError, match="first-parent"):
         GitProvider(repo, tmp_path / "run").history(side, commits[-1])
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("changed_on_retry", [False, True])
+def test_resume_retries_execution_failure_without_erasing_prior_evidence(
+    scenario, tmp_path, monkeypatch, changed_on_retry
+):
+    from divergence.storage import atomic_json
+
+    repo, commits = history(tmp_path)
+    output = tmp_path / "run"
+    original_capture = CommandAdapter.capture
+    calls = 0
+
+    def fail_second_capture(adapter, source, folder, recipe):
+        nonlocal calls
+        if "# revision 4" in (source / "app.py").read_text():
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("temporary runtime unavailable")
+        return original_capture(adapter, source, folder, recipe)
+
+    monkeypatch.setattr(CommandAdapter, "capture", fail_second_capture)
+    first = Search(repo, commits[0], commits[-1], scenario, output).run()
+    assert first["status"] == "AMBIGUOUS"
+    failed = first["trials"][commits[4]]
+    assert failed["retryable"] is True
+    assert len(failed["captures"]) == 1
+
+    def retry_capture(adapter, source, folder, recipe):
+        trace = original_capture(adapter, source, folder, recipe)
+        if changed_on_retry and "# revision 4" in (source / "app.py").read_text():
+            for sample in trace.samples:
+                sample.state["door"]["open"] = False
+            atomic_json(folder / "trace.json", trace.model_dump())
+        return trace
+
+    monkeypatch.setattr(CommandAdapter, "capture", retry_capture)
+    result = Search(repo, commits[0], commits[-1], scenario, output).run(
+        resume=True, retry_inconclusive=True
+    )
+    retried = result["trials"][commits[4]]
+    assert len(retried["previous_attempts"]) == 1
+    assert retried["previous_attempts"][0]["captures"] == failed["captures"]
+    assert (output / failed["captures"][0]["path"] / "trace.json").is_file()
+    assert retried["retryable"] is False
+    if changed_on_retry:
+        assert result["status"] == "AMBIGUOUS"
+        assert retried["verdict"] == "INCONCLUSIVE"
+        assert any("earlier attempt" in error for error in retried["errors"])
+    else:
+        assert result["status"] == "FOUND"
+        assert result["culprit"] == commits[5]
+        assert retried["verdict"] == "GOOD"
+
+    def no_more_capture(*args):
+        pytest.fail(
+            "completed or behaviorally inconsistent evidence must not be selectively retried"
+        )
+
+    monkeypatch.setattr(CommandAdapter, "capture", no_more_capture)
+    repeated = Search(repo, commits[0], commits[-1], scenario, output).run(
+        resume=True, retry_inconclusive=True
+    )
+    assert repeated["status"] == result["status"]
+
+
+def test_retry_requires_existing_resume(scenario, tmp_path):
+    repo, commits = history(tmp_path, count=2, bad_at=1)
+    with pytest.raises(ValueError, match="requires --resume"):
+        Search(repo, commits[0], commits[-1], scenario, tmp_path / "run").run(
+            retry_inconclusive=True
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("conflict", ["verdict", "state"])
+def test_partial_repeats_cannot_hide_flakiness_behind_later_execution_failure(
+    scenario, tmp_path, monkeypatch, conflict
+):
+    from divergence.storage import atomic_json
+
+    scenario.repeats = 4
+    repo, commits = history(tmp_path, count=3, bad_at=2)
+    original = CommandAdapter.capture
+    calls = 0
+
+    def capture(adapter, source, folder, recipe):
+        nonlocal calls
+        targeted = "# revision 1" in (source / "app.py").read_text()
+        if targeted:
+            calls += 1
+            if calls == 3:
+                raise RuntimeError("later execution failure")
+        trace = original(adapter, source, folder, recipe)
+        if targeted:
+            for sample in trace.samples:
+                if conflict == "verdict":
+                    sample.state["door"]["open"] = calls == 1
+                else:
+                    sample.state["unstable"] = calls
+            atomic_json(folder / "trace.json", trace.model_dump())
+        return trace
+
+    monkeypatch.setattr(CommandAdapter, "capture", capture)
+    output = tmp_path / "run"
+    result = Search(repo, commits[0], commits[-1], scenario, output).run()
+    assert result["status"] == "AMBIGUOUS"
+    assert result["trials"][commits[1]]["retryable"] is False
+    resumed = Search(repo, commits[0], commits[-1], scenario, output).run(
+        resume=True, retry_inconclusive=True
+    )
+    assert resumed["status"] == "AMBIGUOUS"
+    assert calls == 3
