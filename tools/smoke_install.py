@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -65,6 +66,7 @@ def smoke(wheel: Path, output: Path) -> dict:
     run("doctor", [*prefix, "doctor"])
     run("provider-help", [*prefix, "bisect", "--help"])
     provider_help = (output / "provider-help.log").read_text(encoding="utf-8")
+    provider_help = re.sub(r"\x1b\[[0-9;]*m", "", provider_help)
     if not all(flag in provider_help for flag in ("--git-lfs", "--git-submodules", "--cm-executable", "--svn-executable")):
         raise RuntimeError("installed CLI is missing version-control provider options")
     run(
