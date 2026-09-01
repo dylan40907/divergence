@@ -63,7 +63,8 @@ def smoke(wheel: Path, output: Path) -> dict:
         raise RuntimeError("smoke environment is not an isolated core-only wheel installation")
     prefix = ["-m", "divergence"]
     run("doctor", [*prefix, "doctor"])
-    provider_help = run("provider-help", [*prefix, "bisect", "--help"])
+    run("provider-help", [*prefix, "bisect", "--help"])
+    provider_help = (output / "provider-help.log").read_text(encoding="utf-8")
     if not all(flag in provider_help for flag in ("--git-lfs", "--git-submodules", "--cm-executable", "--svn-executable")):
         raise RuntimeError("installed CLI is missing version-control provider options")
     run(
