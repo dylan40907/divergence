@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -19,22 +20,32 @@ from divergence.models import load_scenario, load_trace
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Find regressions in Git history using reproducible runtime evidence.",
+    help="Find regressions in Git or Perforce history using reproducible runtime evidence.",
     pretty_exceptions_enable=False,
 )
 console = Console()
 
 
-def fresh_output() -> Path:
-    return Path(".divergence/runs") / (
+def fresh_output(scm: str = "git") -> Path:
+    if scm == "perforce":
+        state_root = Path(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("XDG_STATE_HOME")
+            or (Path.home() / ".local/state")
+        )
+        root = state_root / "Divergence/runs"
+    else:
+        root = Path(".divergence/runs")
+    return root / (
         datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     )
 
 
 def progress(event: dict):
     if event["kind"] == "testing":
+        noun = "changelist" if event.get("provider") == "perforce" else "revision"
         console.print(
-            f"Testing {event['sha'][:8]} · revision {event['index'] + 1}/{event['total']}",
+            f"Testing {event['sha'][:12]} · {noun} {event['index'] + 1}/{event['total']}",
             style="cyan",
             markup=False,
         )
@@ -60,9 +71,14 @@ def execute_search(
     audit: bool = False,
     retry_inconclusive: bool = False,
     verify_only: bool = False,
+    scm: str = "git",
+    p4_client: str | None = None,
+    p4_filespec: str | None = None,
+    p4_executable: str = "p4",
 ) -> dict:
     from divergence.engine import Search
     from divergence.report import render_report
+    from divergence.revisions import PerforceProvider
 
     config = load_scenario(scenario)
     if model:
@@ -70,18 +86,42 @@ def execute_search(
 
         config.policy.fusion = LinearFusion.model_validate_json(model.read_text(encoding="utf-8"))
         config.policy.mode = "learned"
+    if scm not in {"git", "perforce"}:
+        raise ValueError("--scm must be git or perforce")
+    if scm == "git" and (p4_client or p4_filespec or p4_executable != "p4"):
+        raise ValueError("Perforce options require --scm perforce")
+    provider = (
+        PerforceProvider(
+            repository,
+            output,
+            client=p4_client,
+            filespec=p4_filespec,
+            executable=p4_executable,
+        )
+        if scm == "perforce"
+        else None
+    )
     console.print(
-        "Running trusted application code in disposable checkouts. This is not a security sandbox.",
+        "Running trusted application code in an isolated revision workspace. This is not a security sandbox.",
         style="dim",
     )
     search = Search(
-        repository, good, bad, config, output, progress, audit=audit, verify_only=verify_only
+        repository,
+        good,
+        bad,
+        config,
+        output,
+        progress,
+        audit=audit,
+        verify_only=verify_only,
+        provider=provider,
     )
     result = search.run(resume=resume, retry_inconclusive=retry_inconclusive)
     report = render_report(output)
     console.print(f"\n{result['status']}: {result['message']}", style="bold", markup=False)
     if result.get("culprit"):
-        console.print(f"First bad commit: {result['culprit']}", markup=False)
+        noun = "changelist" if scm == "perforce" else "commit"
+        console.print(f"First bad {noun}: {result['culprit']}", markup=False)
     if result["status"] == "AMBIGUOUS":
         for sha in result["candidates"]:
             console.print(f"  possible: {sha}", markup=False)
@@ -96,6 +136,8 @@ def doctor():
     table.add_row("Divergence", __version__)
     table.add_row("Python", platform.python_version())
     table.add_row("Git", shutil.which("git") or "Missing (required)")
+    table.add_row("Perforce", shutil.which("p4") or "Not installed (required only for Perforce/UGS)")
+    table.add_row("UnrealGameSync", shutil.which("UnrealGameSync") or "Not on PATH (optional)")
     for package in ("playwright", "pygame", "sklearn"):
         table.add_row(
             package,
@@ -121,6 +163,46 @@ def doctor():
         "Godot", shutil.which("godot") or shutil.which("godot4") or "Not installed (optional)"
     )
     console.print(table)
+
+
+@app.command("perforce-check")
+def perforce_check(
+    repo: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, help="Path inside the mapped UGS workspace."),
+    ] = Path("."),
+    p4_client: Annotated[
+        str | None, typer.Option(help="UGS/Perforce client; auto-detected by default.")
+    ] = None,
+    p4_filespec: Annotated[
+        str | None, typer.Option(help="History scope; defaults to the complete selected client view.")
+    ] = None,
+    p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
+):
+    """Read Perforce connection/view metadata without syncing or changing a workspace."""
+    from divergence.revisions import PerforceProvider
+
+    try:
+        provider = PerforceProvider(
+            repo,
+            fresh_output("perforce").parent / "connection-probe",
+            client=p4_client,
+            filespec=p4_filespec,
+            executable=p4_executable,
+        )
+        details = provider.inspect()
+        details["latest_visible_change"] = provider.resolve("HEAD")
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(2) from exc
+    table = Table("Perforce setting", "Value")
+    for key, value in details.items():
+        table.add_row(key.replace("_", " ").title(), str(value))
+    console.print(table)
+    console.print(
+        "Read-only check complete. A real run creates a separate temporary client under its output directory.",
+        style="green",
+    )
 
 
 @app.command()
@@ -191,13 +273,82 @@ def init(
     )
 
 
+@app.command("unreal-init")
+def unreal_init(
+    project: Annotated[
+        str, typer.Option(help=".uproject path relative to the UGS workspace root.")
+    ],
+    test: Annotated[str, typer.Option(help="Unreal Automation test path/filter.")],
+    editor: Annotated[
+        str,
+        typer.Option(help="Absolute Editor-Cmd executable, PATH name, or workspace-relative path."),
+    ] = "UnrealEditor-Cmd.exe",
+    output: Annotated[
+        Path, typer.Option(help="New scenario YAML path; never overwrites an existing file.")
+    ] = Path("divergence-unreal.yaml"),
+    name: Annotated[str, typer.Option(help="Scenario name shown in reports.")] = "Unreal automation",
+    timeout_seconds: Annotated[int, typer.Option(min=1, max=3600)] = 900,
+    null_rhi: Annotated[
+        bool, typer.Option(help="Run with -nullrhi; disable for screenshot/rendering tests.")
+    ] = False,
+):
+    """Create a Perforce-ready Unreal Automation scenario without running the project."""
+    if output.exists():
+        console.print("scenario output already exists; choose a new path", style="red")
+        raise typer.Exit(2)
+    if Path(project).is_absolute() or Path(project).suffix.lower() != ".uproject":
+        console.print("--project must be a workspace-relative .uproject path", style="red")
+        raise typer.Exit(2)
+    if not test or any(character in test for character in (';', '"', "'", "\n", "\r")):
+        console.print("--test contains unsupported Unreal command characters", style="red")
+        raise typer.Exit(2)
+    command = [
+        "{python}",
+        "-m",
+        "divergence.unreal",
+        "--editor",
+        editor,
+        "--project",
+        project,
+        "--test",
+        test,
+        *(["--null-rhi"] if null_rhi else []),
+    ]
+    scenario = {
+        "schema_version": 1,
+        "name": name,
+        "adapter": "command",
+        "command": command,
+        "build": [],
+        "seed": 42,
+        "duration_ms": 1000,
+        "sample_ms": 100,
+        "timeout_seconds": timeout_seconds,
+        "repeats": 2,
+        "assertions": [
+            {"path": "unreal.total", "op": "gt", "value": 0, "at": "end"},
+            {"path": "unreal.failed", "op": "eq", "value": 0, "at": "end"},
+            {"path": "unreal.not_run", "op": "eq", "value": 0, "at": "end"},
+            {"path": "unreal.in_process", "op": "eq", "value": 0, "at": "end"},
+        ],
+        "policy": {"mode": "assertions"},
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(yaml.safe_dump(scenario, sort_keys=False), encoding="utf-8")
+    console.print(f"Created: {output.resolve()}", style="green", markup=False)
+    console.print(
+        "No project or Perforce data was changed. Add trusted build commands if the selected client view does not provide runnable binaries, then validate and verify a submitted changelist.",
+        style="yellow",
+    )
+
+
 @app.command()
 def verify(
     scenario: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")
     ],
     revision: Annotated[
-        str, typer.Option(help="Committed Git revision to replay; excludes uncommitted work.")
+        str, typer.Option(help="Git revision or submitted Perforce changelist to replay.")
     ] = "HEAD",
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("."),
     output: Annotated[
@@ -212,6 +363,15 @@ def verify(
             help="With --resume, retry execution failures once, retaining prior evidence."
         ),
     ] = False,
+    scm: Annotated[str, typer.Option(help="Revision provider: git or perforce.")] = "git",
+    p4_client: Annotated[
+        str | None, typer.Option(help="UGS/Perforce client view to clone; auto-detected by default.")
+    ] = None,
+    p4_filespec: Annotated[
+        str | None,
+        typer.Option(help="Perforce history scope, for example //client/Project/...."),
+    ] = None,
+    p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
 ):
     """Check replay, assertions, and repeatability at one revision. Executes trusted code."""
     if resume and output is None:
@@ -223,10 +383,14 @@ def verify(
             revision,
             revision,
             scenario,
-            output or fresh_output(),
+            output or fresh_output(scm),
             resume=resume,
             retry_inconclusive=retry_inconclusive,
             verify_only=True,
+            scm=scm,
+            p4_client=p4_client,
+            p4_filespec=p4_filespec,
+            p4_executable=p4_executable,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(str(exc), style="red", markup=False)
@@ -239,8 +403,8 @@ def bisect(
     scenario: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")
     ],
-    good: Annotated[str, typer.Option(help="Known-good Git revision.")],
-    bad: Annotated[str, typer.Option(help="Known-bad Git revision.")] = "HEAD",
+    good: Annotated[str, typer.Option(help="Known-good Git revision or Perforce changelist.")],
+    bad: Annotated[str, typer.Option(help="Known-bad Git revision or Perforce changelist.")] = "HEAD",
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("."),
     output: Annotated[
         Path | None, typer.Option(help="Run directory (new unless --resume).")
@@ -268,8 +432,17 @@ def bisect(
             help="Test every revision to check for fixed-and-reintroduced regressions (slower)."
         ),
     ] = False,
+    scm: Annotated[str, typer.Option(help="Revision provider: git or perforce.")] = "git",
+    p4_client: Annotated[
+        str | None, typer.Option(help="UGS/Perforce client view to clone; auto-detected by default.")
+    ] = None,
+    p4_filespec: Annotated[
+        str | None,
+        typer.Option(help="Perforce history scope, for example //client/Project/...."),
+    ] = None,
+    p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
 ):
-    """Locate the first bad commit on a first-parent history. Executes trusted code."""
+    """Locate the first bad revision in a Git or Perforce history. Executes trusted code."""
     if resume and output is None:
         console.print("--resume requires the original --output directory", style="red")
         raise typer.Exit(2)
@@ -279,11 +452,15 @@ def bisect(
             good,
             bad,
             scenario,
-            output or fresh_output(),
+            output or fresh_output(scm),
             resume,
             model,
             audit,
             retry_inconclusive,
+            scm=scm,
+            p4_client=p4_client,
+            p4_filespec=p4_filespec,
+            p4_executable=p4_executable,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(str(exc), style="red", markup=False)

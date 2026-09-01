@@ -179,6 +179,15 @@ and [Python handle inheritance](https://docs.python.org/3/library/subprocess.htm
 Generate evidence from actual runtime logic. The adapter must not read revision labels or demo
 ground truth to classify runs. Divergence owns classification.
 
+## Unreal Automation reports
+
+`divergence unreal-init` creates a command-protocol scenario that launches `UnrealEditor-Cmd`, runs
+an existing Automation test/filter, exports its `index.json`, and converts the official result counts
+and named failures/warnings into a strict Divergence trace. The original report and editor log remain
+in each capture. Missing, oversized, malformed, inconsistent, or unfinished reports are execution
+failures, never passing behavior. See [Perforce/UGS and Unreal](PERFORCE_UGS.md) for setup and the
+boundary between aggregate Automation results and richer project-side instrumentation.
+
 ## Browser scenarios
 
 Serve a static entry from the checkout and expose these hooks, or supply equivalent expressions:

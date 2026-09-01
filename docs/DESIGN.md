@@ -5,8 +5,9 @@ regression search whose decisions can be inspected, reproduced, and disputed.
 
 ## Boundaries
 
-- Git provider: first-parent ancestry only, explicitly reported. The searched property must remain
-  bad after its introduction. Fixed-and-reintroduced bugs require a narrower range or a linear audit.
+- Git provider: first-parent ancestry only. Perforce provider: visible submitted changes affecting
+  one filespec, using a disposable clone of the active client spec. Both scopes are explicit. The
+  searched property must remain bad after introduction; fixed-and-reintroduced bugs need an audit.
 - A private clone protects the input repository from checkout/build mutations. This is **not a
   security sandbox**. Build commands, browser expressions, and executable adapters are trusted code.
 - No automatic dependency installation from arbitrary revisions; users provide build commands.
@@ -22,9 +23,9 @@ ordered samples on scenario time, state, events, logs, metrics, and optional rel
 An assertion says which property makes a run bad; generic differences are used only when explicitly
 enabled. Appearance differences alone do not prove semantic failure.
 
-Adapters: command protocol for any instrumented runtime; Playwright for DOM-based or instrumented web apps;
-Pygame and Godot examples use the command protocol. Future Perforce work belongs behind the revision
-provider contract, not inside an engine adapter.
+Adapters: command protocol for any instrumented runtime; Playwright for DOM-based or instrumented
+web apps; Pygame and Godot examples use the command protocol. The Unreal Automation bridge also uses
+that protocol. Git and Perforce remain revision providers, separate from engine capture behavior.
 
 ## Oracle
 

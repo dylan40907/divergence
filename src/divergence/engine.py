@@ -20,7 +20,7 @@ from divergence.evidence import read_run, validate_saved_trials
 from divergence.models import Comparison, Scenario, load_trace
 from divergence.oracle import compare
 from divergence.process import run_command
-from divergence.revisions import GitProvider, python_regions, rank_changes
+from divergence.revisions import GitProvider, RevisionProvider, python_regions, rank_changes
 from divergence.storage import atomic_json
 
 
@@ -80,11 +80,12 @@ class Search:
         *,
         audit: bool = False,
         verify_only: bool = False,
+        provider: RevisionProvider | None = None,
     ):
         if verify_only and (audit or good != bad):
             raise ValueError("verification requires one revision and cannot audit history")
         self.output = output.resolve()
-        self.provider = GitProvider(repository, self.output)
+        self.provider = provider or GitProvider(repository, self.output)
         self.history = (
             [self.provider.resolve(good)] if verify_only else self.provider.history(good, bad)
         )
@@ -106,9 +107,19 @@ class Search:
         scenario: Scenario,
         output: Path,
         progress: Callable[[dict], None] | None = None,
+        provider: RevisionProvider | None = None,
     ) -> Search:
         """Exercise one committed revision without requiring a regression interval."""
-        return cls(repository, revision, revision, scenario, output, progress, verify_only=True)
+        return cls(
+            repository,
+            revision,
+            revision,
+            scenario,
+            output,
+            progress,
+            verify_only=True,
+            provider=provider,
+        )
 
     def persist(self):
         atomic_json(self.output / "run.json", self.state)
@@ -141,7 +152,13 @@ class Search:
                 return saved
             self.retried.add(revision)
         self.progress(
-            {"kind": "testing", "sha": revision, "index": index, "total": len(self.history)}
+            {
+                "kind": "testing",
+                "sha": revision,
+                "index": index,
+                "total": len(self.history),
+                "provider": self.provider.identity()["kind"],
+            }
         )
         started = time.monotonic()
         captures = []
@@ -293,13 +310,17 @@ class Search:
         self.validated.clear()
         self.reference = None
         with run_lock(self.output):
-            return self._run(resume)
+            try:
+                return self._run(resume)
+            finally:
+                self.provider.cleanup()
 
     def _run(self, resume: bool) -> dict:
         identity = {
             "scenario_digest": self.scenario.digest,
             "runner_fingerprint": runner_fingerprint(),
             "repository": str(self.provider.repository),
+            "revision_provider": self.provider.identity(),
             "good": self.history[0],
             "bad": self.history[-1],
             "audit": self.audit,
@@ -328,7 +349,7 @@ class Search:
                 "history": [self.provider.describe(sha) for sha in self.history],
                 "trials": {},
                 "status": "RUNNING",
-                "scope": "single-revision" if self.verify_only else "first-parent",
+                "scope": "single-revision" if self.verify_only else self.provider.scope,
                 "candidates": [],
                 "limitations": (
                     [
@@ -342,6 +363,7 @@ class Search:
                         "Assumes the tested regression remains present after introduction.",
                         "Source ranking is correlation, not proof of causation.",
                         f"Observed divergence is sampled every {self.scenario.sample_ms} ms.",
+                        *self.provider.limitations(),
                     ]
                 ),
             }

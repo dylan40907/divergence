@@ -32,7 +32,7 @@ jobs:
       - run: python -m ruff check src tests tools
       - run: python -m pytest -q --junitxml=results/core.xml
       - run: python -m build
-      - run: python tools/smoke_install.py --wheel dist/divergence_hunter-0.1.0a1-py3-none-any.whl --output .divergence/installed-smoke
+      - run: python tools/smoke_install.py --wheel dist/divergence_hunter-0.2.0a1-py3-none-any.whl --output .divergence/installed-smoke
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

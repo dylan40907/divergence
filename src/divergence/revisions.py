@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import os
 import re
+import shutil
+import stat
 import subprocess
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -36,12 +42,25 @@ def git(path: Path, *args: str, timeout: int = 60) -> str:
 
 
 class RevisionProvider(Protocol):
+    repository: Path
+    scope: str
+
+    def resolve(self, ref: str) -> str: ...
     def history(self, good: str, bad: str) -> list[str]: ...
+    def prepare(self) -> None: ...
     def checkout(self, revision: str, name: str) -> Path: ...
+    def release(self, target: Path) -> None: ...
+    def cleanup(self) -> None: ...
     def describe(self, revision: str) -> dict: ...
+    def diff(self, revision: str) -> str: ...
+    def read_file(self, revision: str, path: str) -> str: ...
+    def identity(self) -> dict: ...
+    def limitations(self) -> list[str]: ...
 
 
 class GitProvider:
+    scope = "first-parent"
+
     def __init__(self, repository: Path, run_dir: Path):
         self.repository = Path(git(repository.resolve(), "rev-parse", "--show-toplevel")).resolve()
         self.run_dir = run_dir.resolve()
@@ -122,6 +141,371 @@ class GitProvider:
     def read_file(self, revision: str, path: str) -> str:
         return git(self.repository, "show", "--no-ext-diff", "--no-textconv", f"{revision}:{path}")[
             :500000
+        ]
+
+    def cleanup(self) -> None:
+        """Git worktrees are released after each capture; keep the private clone for resume."""
+
+    def identity(self) -> dict:
+        return {"kind": "git", "repository": str(self.repository)}
+
+    def limitations(self) -> list[str]:
+        return ["Searches a Git first-parent history."]
+
+
+P4Runner = Callable[[list[str], Path, str | None, int], subprocess.CompletedProcess[str]]
+
+
+def _default_p4_runner(
+    argv: list[str], cwd: Path, input_text: str | None, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        env=os.environ.copy(),
+    )
+
+
+def _form_fields(form: str) -> dict[str, list[str]]:
+    """Parse a P4 form without interpreting values or continuation text."""
+    fields: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in form.splitlines():
+        match = re.match(r"^([A-Za-z][A-Za-z0-9]*):(?:\s*(.*))?$", line)
+        if match:
+            current = match.group(1)
+            value = (match.group(2) or "").strip()
+            fields[current] = [value] if value else []
+        elif current and (line.startswith("\t") or line.startswith("    ")):
+            fields[current].append(line.strip())
+    return fields
+
+
+def _set_form_field(form: str, field: str, values: list[str]) -> str:
+    lines = form.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith(field + ":")), None)
+    replacement = [f"{field}:" + (f"\t{values[0]}" if len(values) == 1 else "")]
+    if len(values) != 1:
+        replacement.extend(f"\t{value}" for value in values)
+    if start is None:
+        lines.extend(["", *replacement])
+    else:
+        end = start + 1
+        while end < len(lines) and (not lines[end] or lines[end][0].isspace()):
+            end += 1
+        lines[start:end] = replacement
+    return "\n".join(lines) + "\n"
+
+
+class PerforceProvider:
+    """Submitted-changelist provider using a dedicated clone of a UGS/P4 client view."""
+
+    scope = "submitted-changelists"
+
+    def __init__(
+        self,
+        repository: Path,
+        run_dir: Path,
+        *,
+        client: str | None = None,
+        filespec: str | None = None,
+        executable: str = "p4",
+        runner: P4Runner | None = None,
+    ):
+        self.repository = repository.resolve()
+        self.run_dir = run_dir.resolve()
+        self.executable = executable
+        self.runner = runner or _default_p4_runner
+        self.template_client = client
+        self.filespec = filespec
+        self.workspace = (self.run_dir / "perforce-workspace").resolve()
+        self._prepared = False
+        self._active = False
+        info = self._records("info", client=client)[0]
+        self.server = str(info.get("serverAddress") or "")
+        self.user = str(info.get("userName") or "")
+        self.template_client = client or str(info.get("clientName") or "")
+        if not self.server or not self.user or not self.template_client or self.template_client == "*unknown*":
+            raise RevisionError(
+                "Perforce connection needs a logged-in user and mapped client; pass --p4-client if discovery fails"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.template_client):
+            raise RevisionError("Perforce client name contains unsupported characters")
+        self.template_fields = _form_fields(
+            self._invoke("client", "-o", self.template_client, client=self.template_client)
+        )
+        roots = self.template_fields.get("Root", []) + self.template_fields.get("AltRoots", [])
+        resolved_roots = [Path(root).resolve() for root in roots if root and root.lower() != "null"]
+        self.active_root = next(
+            (root for root in resolved_roots if self.repository.is_relative_to(root)), None
+        )
+        if self.active_root is None:
+            raise RevisionError(
+                "the selected Perforce client does not contain the requested workspace path"
+            )
+        if self.workspace.is_relative_to(self.active_root) or self.active_root.is_relative_to(
+            self.workspace
+        ):
+            raise RevisionError(
+                "Perforce run output must be outside the active UGS client root so isolation and cleanup cannot touch it"
+            )
+        if filespec is None:
+            self.filespec = f"//{self.template_client}/..."
+        elif not filespec.startswith("//") or "@" in filespec or "#" in filespec:
+            raise RevisionError("--p4-filespec must be a depot/client filespec without a revision")
+        digest = hashlib.sha256(
+            f"{self.server}\0{self.user}\0{self.template_client}\0{self.run_dir}".encode()
+        ).hexdigest()[:16]
+        self.client = f"divergence_{digest}"
+        self._stream = False
+
+    def _invoke(
+        self,
+        *args: str,
+        client: str | None = None,
+        json_output: bool = False,
+        input_text: str | None = None,
+        timeout: int = 120,
+    ) -> str:
+        argv = [self.executable]
+        if json_output:
+            argv.extend(["-ztag", "-Mj"])
+        argv.extend(["-d", str(self.repository)])
+        selected = client if client is not None else self.template_client
+        if selected:
+            argv.extend(["-c", selected])
+        argv.extend(args)
+        try:
+            result = self.runner(argv, self.repository, input_text, timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RevisionError(f"Perforce could not run: {exc}") from exc
+        if result.returncode:
+            message = result.stderr.strip() or result.stdout.strip() or f"p4 {args[0]} failed"
+            raise RevisionError(message[:2000])
+        return result.stdout
+
+    def _records(self, *args: str, client: str | None = None) -> list[dict]:
+        raw = self._invoke(*args, client=client, json_output=True)
+        records = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RevisionError("Perforce returned malformed JSON output") from exc
+            if record.get("code") in {"error", "fatal"}:
+                raise RevisionError(str(record.get("data") or "Perforce command failed")[:2000])
+            if record.get("code") in {None, "stat"}:
+                records.append(record)
+        if not records:
+            raise RevisionError(f"Perforce returned no records for {args[0]}")
+        return records
+
+    def inspect(self) -> dict:
+        return {
+            "server": self.server,
+            "user": self.user,
+            "template_client": self.template_client,
+            "active_client_root": str(self.active_root),
+            "stream": (self.template_fields.get("Stream") or [""])[0] or "classic view",
+            "search_filespec": self.filespec,
+            "temporary_client": self.client,
+            "temporary_root": str(self.workspace),
+        }
+
+    def resolve(self, ref: str) -> str:
+        if ref == "HEAD":
+            records = self._records("changes", "-m", "1", "-s", "submitted", self.filespec)
+            ref = str(records[0].get("change", ""))
+        if not re.fullmatch(r"[1-9][0-9]*", ref):
+            raise RevisionError("Perforce revisions must be submitted numeric changelists")
+        record = self._records("change", "-o", ref)[0]
+        status = str(record.get("Status") or record.get("status") or "").lower()
+        change = str(record.get("Change") or record.get("change") or ref)
+        if change != ref or status != "submitted":
+            raise RevisionError(f"Perforce changelist {ref} is not submitted or is not visible")
+        return ref
+
+    def history(self, good: str, bad: str) -> list[str]:
+        first, last = self.resolve(good), self.resolve(bad)
+        if int(first) >= int(last):
+            raise RevisionError("good must be an older changelist than bad")
+        records = self._records(
+            "changes", "-s", "submitted", "-r", "-l", f"{self.filespec}@{first},@{last}"
+        )
+        changes = {str(record["change"]) for record in records if "change" in record}
+        changes.update({first, last})
+        history = sorted((change for change in changes if int(first) <= int(change) <= int(last)), key=int)
+        if len(history) < 2:
+            raise RevisionError("Perforce interval contains fewer than two visible revisions")
+        return history
+
+    def prepare(self) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        if self._prepared:
+            return
+        if self.workspace.exists() and any(self.workspace.iterdir()):
+            raise RevisionError("Perforce workspace root is not empty; cleanup or use a new output")
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        client_created = False
+        try:
+            form = self._invoke(
+                "client", "-t", self.template_client, "-o", self.client, client=self.template_client
+            )
+            fields = _form_fields(form)
+            if fields.get("Client") != [self.client]:
+                form = _set_form_field(form, "Client", [self.client])
+            form = _set_form_field(form, "Root", [str(self.workspace)])
+            form = _set_form_field(form, "Host", [])
+            form = _set_form_field(
+                form,
+                "Description",
+                ["Temporary Divergence regression workspace; safe to delete after the run."],
+            )
+            form = _set_form_field(form, "AltRoots", [])
+            form = _set_form_field(form, "ChangeView", [])
+            form = _set_form_field(form, "StreamAtChange", [])
+            parsed = _form_fields(form)
+            view = parsed.get("View", [])
+            self._stream = bool(parsed.get("Stream"))
+            if view and any(
+                not line.startswith("-") and f"//{self.client}/" not in line for line in view
+            ):
+                raise RevisionError(
+                    "cloned Perforce client view does not map only to the temporary client"
+                )
+            self._invoke("client", "-i", client=self.template_client, input_text=form)
+            client_created = True
+            saved = _form_fields(self._invoke("client", "-o", self.client, client=self.client))
+            if saved.get("Root") != [str(self.workspace)]:
+                raise RevisionError("Perforce server did not preserve the isolated workspace root")
+            self._prepared = True
+        except Exception:
+            if client_created:
+                self._delete_client(best_effort=True)
+            try:
+                self._remove_workspace()
+            except OSError:
+                pass
+            raise
+
+    def checkout(self, revision: str, name: str) -> Path:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+            raise RevisionError("invalid checkout name")
+        if not self._prepared or self._active:
+            raise RevisionError("Perforce workspace is not ready or is already active")
+        revision = self.resolve(revision)
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        args = ["sync", "-q"]
+        if self._stream:
+            args.append(f"--use-stream-change={revision}")
+        args.append(f"//{self.client}/...@{revision}")
+        self._invoke(*args, client=self.client, timeout=3600)
+        self._active = True
+        return self.workspace
+
+    def _remove_workspace(self) -> None:
+        target = self.workspace.resolve()
+        expected = (self.run_dir / "perforce-workspace").resolve()
+        if target != expected or not target.is_relative_to(self.run_dir):
+            raise RevisionError("refusing to remove a Perforce workspace outside this run")
+        if not target.exists():
+            return
+
+        def writable(function, path, _error):
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(target, onerror=writable)
+
+    def release(self, target: Path) -> None:
+        if target.resolve() != self.workspace.resolve():
+            raise RevisionError("refusing to release an unknown Perforce workspace")
+        try:
+            try:
+                self._invoke("revert", f"//{self.client}/...", client=self.client)
+            except RevisionError as exc:
+                if "not opened" not in str(exc).lower():
+                    raise
+            self._invoke("sync", "-q", f"//{self.client}/...#none", client=self.client, timeout=3600)
+        finally:
+            self._active = False
+            self._remove_workspace()
+
+    def _delete_client(self, *, best_effort: bool = False) -> None:
+        try:
+            self._invoke("client", "-d", self.client, client=self.template_client)
+        except RevisionError:
+            if not best_effort:
+                raise
+
+    def cleanup(self) -> None:
+        if not self._prepared:
+            return
+        try:
+            if self._active:
+                self.release(self.workspace)
+        finally:
+            try:
+                self._delete_client()
+            finally:
+                self._prepared = False
+                self._active = False
+                self._remove_workspace()
+
+    def describe(self, revision: str) -> dict:
+        revision = self.resolve(revision)
+        record = self._records("describe", "-s", revision)[0]
+        description = str(record.get("desc") or record.get("Description") or "").strip()
+        timestamp = int(record.get("time") or 0)
+        return {
+            "sha": revision,
+            "subject": description.splitlines()[0][:200] if description else f"Changelist {revision}",
+            "author": str(record.get("user") or record.get("User") or "unknown"),
+            "date": datetime.fromtimestamp(timestamp, UTC).isoformat() if timestamp else "",
+            "revision_kind": "perforce-changelist",
+        }
+
+    def diff(self, revision: str) -> str:
+        raw = self._invoke("describe", "-du", self.resolve(revision), timeout=300)[:200000]
+        blocks = []
+        matches = list(re.finditer(r"^==== (//.+?)#\d+ .*?====\s*$", raw, re.MULTILINE))
+        for index, match in enumerate(matches):
+            depot = match.group(1)
+            path = depot.removeprefix("//")
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+            body = raw[match.end() : end]
+            body = re.sub(r"^--- .*?$", f"--- a/{path}", body, flags=re.MULTILINE)
+            body = re.sub(r"^\+\+\+ .*?$", f"+++ b/{path}", body, flags=re.MULTILINE)
+            blocks.append(f"diff --git a/{path} b/{path}\n{body.lstrip()}")
+        return "\n".join(blocks)[:200000]
+
+    def read_file(self, revision: str, path: str) -> str:
+        depot = "//" + path.lstrip("/")
+        return self._invoke("print", "-q", f"{depot}@{self.resolve(revision)}", timeout=300)[:500000]
+
+    def identity(self) -> dict:
+        return {
+            "kind": "perforce",
+            "server": self.server,
+            "user": self.user,
+            "template_client": self.template_client,
+            "filespec": self.filespec,
+        }
+
+    def limitations(self) -> list[str]:
+        return [
+            "Searches visible submitted Perforce changelists affecting the configured filespec.",
+            "Uses a dedicated temporary client cloned from the selected UGS/Perforce client view; the active workspace is not synced or cleaned.",
+            "Perforce permissions, UGS sync filters, stream imports, and available precompiled binaries still determine what can be reproduced.",
         ]
 
 
