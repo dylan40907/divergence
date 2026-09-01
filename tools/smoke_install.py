@@ -52,7 +52,7 @@ def smoke(wheel: Path, output: Path) -> dict:
             "imports",
             [
                 "-c",
-                "import divergence,importlib.util,json,platform; print(json.dumps({'python':platform.python_version(),'platform':platform.platform(),'module':divergence.__file__,'optional_absent':all(importlib.util.find_spec(n) is None for n in ('playwright','pygame','sklearn'))}))",
+                "import divergence,divergence.plastic_provider,divergence.svn_provider,importlib.util,json,platform; print(json.dumps({'python':platform.python_version(),'platform':platform.platform(),'module':divergence.__file__,'version':divergence.__version__,'revision_providers':['git','perforce','plastic','svn'],'optional_absent':all(importlib.util.find_spec(n) is None for n in ('playwright','pygame','sklearn'))}))",
             ],
         )
     )
@@ -63,6 +63,9 @@ def smoke(wheel: Path, output: Path) -> dict:
         raise RuntimeError("smoke environment is not an isolated core-only wheel installation")
     prefix = ["-m", "divergence"]
     run("doctor", [*prefix, "doctor"])
+    provider_help = run("provider-help", [*prefix, "bisect", "--help"])
+    if not all(flag in provider_help for flag in ("--git-lfs", "--git-submodules", "--cm-executable", "--svn-executable")):
+        raise RuntimeError("installed CLI is missing version-control provider options")
     run(
         "demo", [*prefix, "demo", "--output", "fixture", "--commits", "8", "--bug-at", "6", "--run"]
     )

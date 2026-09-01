@@ -103,6 +103,7 @@ def package(root: Path, sample_report: Path) -> Path:
         "docs/PUBLIC_RELEASE.md",
         "docs/BACKUP.md",
         "docs/PERFORCE_UGS.md",
+        "docs/VERSION_CONTROL.md",
         "docs/assets/report.png",
     ]:
         payload[name] = (root / name).read_bytes()

@@ -20,14 +20,14 @@ from divergence.models import load_scenario, load_trace
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Find regressions in Git or Perforce history using reproducible runtime evidence.",
+    help="Find regressions in Git, Perforce, Unity Version Control, or Subversion history.",
     pretty_exceptions_enable=False,
 )
 console = Console()
 
 
 def fresh_output(scm: str = "git") -> Path:
-    if scm == "perforce":
+    if scm != "git":
         state_root = Path(
             os.environ.get("LOCALAPPDATA")
             or os.environ.get("XDG_STATE_HOME")
@@ -43,7 +43,10 @@ def fresh_output(scm: str = "git") -> Path:
 
 def progress(event: dict):
     if event["kind"] == "testing":
-        noun = "changelist" if event.get("provider") == "perforce" else "revision"
+        noun = {
+            "perforce": "changelist",
+            "plastic": "changeset",
+        }.get(event.get("provider"), "revision")
         console.print(
             f"Testing {event['sha'][:12]} · {noun} {event['index'] + 1}/{event['total']}",
             style="cyan",
@@ -75,10 +78,18 @@ def execute_search(
     p4_client: str | None = None,
     p4_filespec: str | None = None,
     p4_executable: str = "p4",
+    git_lfs: bool = True,
+    git_submodules: bool = True,
+    git_lfs_fetch: bool = True,
+    svn_executable: str = "svn",
+    svn_externals: bool = False,
+    cm_executable: str = "cm",
 ) -> dict:
     from divergence.engine import Search
+    from divergence.plastic_provider import PlasticProvider
     from divergence.report import render_report
-    from divergence.revisions import PerforceProvider
+    from divergence.revisions import GitProvider, PerforceProvider
+    from divergence.svn_provider import SubversionProvider
 
     config = load_scenario(scenario)
     if model:
@@ -86,21 +97,40 @@ def execute_search(
 
         config.policy.fusion = LinearFusion.model_validate_json(model.read_text(encoding="utf-8"))
         config.policy.mode = "learned"
-    if scm not in {"git", "perforce"}:
-        raise ValueError("--scm must be git or perforce")
-    if scm == "git" and (p4_client or p4_filespec or p4_executable != "p4"):
+    scm = "plastic" if scm == "uvcs" else scm
+    if scm not in {"git", "perforce", "plastic", "svn"}:
+        raise ValueError("--scm must be git, perforce, plastic (or uvcs), or svn")
+    if scm != "perforce" and (p4_client or p4_filespec or p4_executable != "p4"):
         raise ValueError("Perforce options require --scm perforce")
-    provider = (
-        PerforceProvider(
+    if scm != "svn" and (svn_executable != "svn" or svn_externals):
+        raise ValueError("Subversion options require --scm svn")
+    if scm != "plastic" and cm_executable != "cm":
+        raise ValueError("Unity Version Control options require --scm plastic or --scm uvcs")
+    if scm == "perforce":
+        provider = PerforceProvider(
             repository,
             output,
             client=p4_client,
             filespec=p4_filespec,
             executable=p4_executable,
         )
-        if scm == "perforce"
-        else None
-    )
+    elif scm == "plastic":
+        provider = PlasticProvider(repository, output, executable=cm_executable)
+    elif scm == "svn":
+        provider = SubversionProvider(
+            repository,
+            output,
+            executable=svn_executable,
+            include_externals=svn_externals,
+        )
+    else:
+        provider = GitProvider(
+            repository,
+            output,
+            materialize_lfs=git_lfs,
+            materialize_submodules=git_submodules,
+            fetch_lfs=git_lfs_fetch,
+        )
     console.print(
         "Running trusted application code in an isolated revision workspace. This is not a security sandbox.",
         style="dim",
@@ -120,7 +150,9 @@ def execute_search(
     report = render_report(output)
     console.print(f"\n{result['status']}: {result['message']}", style="bold", markup=False)
     if result.get("culprit"):
-        noun = "changelist" if scm == "perforce" else "commit"
+        noun = {"perforce": "changelist", "plastic": "changeset", "svn": "revision"}.get(
+            scm, "commit"
+        )
         console.print(f"First bad {noun}: {result['culprit']}", markup=False)
     if result["status"] == "AMBIGUOUS":
         for sha in result["candidates"]:
@@ -136,8 +168,14 @@ def doctor():
     table.add_row("Divergence", __version__)
     table.add_row("Python", platform.python_version())
     table.add_row("Git", shutil.which("git") or "Missing (required)")
+    table.add_row("Git LFS", shutil.which("git-lfs") or "Not installed (needed for LFS content)")
     table.add_row("Perforce", shutil.which("p4") or "Not installed (required only for Perforce/UGS)")
     table.add_row("UnrealGameSync", shutil.which("UnrealGameSync") or "Not on PATH (optional)")
+    table.add_row(
+        "Unity Version Control",
+        shutil.which("cm") or "Not installed (required only for Plastic/UVCS)",
+    )
+    table.add_row("Subversion", shutil.which("svn") or "Not installed (required only for SVN)")
     for package in ("playwright", "pygame", "sklearn"):
         table.add_row(
             package,
@@ -201,6 +239,70 @@ def perforce_check(
     console.print(table)
     console.print(
         "Read-only check complete. A real run creates a separate temporary client under its output directory.",
+        style="green",
+    )
+
+
+@app.command("plastic-check")
+def plastic_check(
+    repo: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, help="Path inside a UVCS/Plastic workspace."),
+    ] = Path("."),
+    cm_executable: Annotated[
+        str, typer.Option(help="Unity Version Control CLI executable.")
+    ] = "cm",
+):
+    """Read Unity Version Control workspace and branch metadata without updating it."""
+    from divergence.plastic_provider import PlasticProvider
+
+    try:
+        provider = PlasticProvider(
+            repo,
+            fresh_output("plastic").parent / "connection-probe-plastic",
+            executable=cm_executable,
+        )
+        details = provider.inspect()
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(2) from exc
+    table = Table("Unity Version Control setting", "Value")
+    for key, value in details.items():
+        table.add_row(key.replace("_", " ").title(), str(value))
+    console.print(table)
+    console.print(
+        "Read-only check complete. A real run creates and deletes a separate static workspace.",
+        style="green",
+    )
+
+
+@app.command("svn-check")
+def svn_check(
+    repo: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, help="Path inside an SVN working copy."),
+    ] = Path("."),
+    svn_executable: Annotated[str, typer.Option(help="Subversion CLI executable.")] = "svn",
+):
+    """Read Subversion working-copy and repository metadata without updating it."""
+    from divergence.svn_provider import SubversionProvider
+
+    try:
+        provider = SubversionProvider(
+            repo,
+            fresh_output("svn").parent / "connection-probe-svn",
+            executable=svn_executable,
+        )
+        details = provider.inspect()
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(2) from exc
+    table = Table("Subversion setting", "Value")
+    for key, value in details.items():
+        table.add_row(key.replace("_", " ").title(), str(value))
+    console.print(table)
+    console.print(
+        "Read-only check complete. A real run creates separate checkouts under its output directory.",
         style="green",
     )
 
@@ -347,9 +449,7 @@ def verify(
     scenario: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")
     ],
-    revision: Annotated[
-        str, typer.Option(help="Git revision or submitted Perforce changelist to replay.")
-    ] = "HEAD",
+    revision: Annotated[str, typer.Option(help="Committed revision or changeset to replay.")] = "HEAD",
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("."),
     output: Annotated[
         Path | None, typer.Option(help="Run directory (new unless --resume).")
@@ -363,7 +463,9 @@ def verify(
             help="With --resume, retry execution failures once, retaining prior evidence."
         ),
     ] = False,
-    scm: Annotated[str, typer.Option(help="Revision provider: git or perforce.")] = "git",
+    scm: Annotated[
+        str, typer.Option(help="Revision provider: git, perforce, plastic/uvcs, or svn.")
+    ] = "git",
     p4_client: Annotated[
         str | None, typer.Option(help="UGS/Perforce client view to clone; auto-detected by default.")
     ] = None,
@@ -372,6 +474,37 @@ def verify(
         typer.Option(help="Perforce history scope, for example //client/Project/...."),
     ] = None,
     p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
+    git_lfs: Annotated[
+        bool,
+        typer.Option("--git-lfs/--no-git-lfs", help="Materialize Git LFS objects."),
+    ] = True,
+    git_submodules: Annotated[
+        bool,
+        typer.Option(
+            "--git-submodules/--no-git-submodules",
+            help="Initialize recursive Git submodules at recorded commits.",
+        ),
+    ] = True,
+    git_lfs_fetch: Annotated[
+        bool,
+        typer.Option(
+            "--git-lfs-fetch/--no-git-lfs-fetch",
+            help="Fetch missing LFS objects from the source repository's configured remote.",
+        ),
+    ] = True,
+    cm_executable: Annotated[
+        str, typer.Option(help="Unity Version Control CLI executable for --scm plastic/uvcs.")
+    ] = "cm",
+    svn_executable: Annotated[
+        str, typer.Option(help="Subversion CLI executable for --scm svn.")
+    ] = "svn",
+    svn_externals: Annotated[
+        bool,
+        typer.Option(
+            "--svn-externals/--no-svn-externals",
+            help="Include svn:externals; disabled by default for reproducibility.",
+        ),
+    ] = False,
 ):
     """Check replay, assertions, and repeatability at one revision. Executes trusted code."""
     if resume and output is None:
@@ -391,6 +524,12 @@ def verify(
             p4_client=p4_client,
             p4_filespec=p4_filespec,
             p4_executable=p4_executable,
+            git_lfs=git_lfs,
+            git_submodules=git_submodules,
+            git_lfs_fetch=git_lfs_fetch,
+            cm_executable=cm_executable,
+            svn_executable=svn_executable,
+            svn_externals=svn_externals,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(str(exc), style="red", markup=False)
@@ -403,8 +542,8 @@ def bisect(
     scenario: Annotated[
         Path, typer.Option(exists=True, dir_okay=False, help="Trusted scenario YAML.")
     ],
-    good: Annotated[str, typer.Option(help="Known-good Git revision or Perforce changelist.")],
-    bad: Annotated[str, typer.Option(help="Known-bad Git revision or Perforce changelist.")] = "HEAD",
+    good: Annotated[str, typer.Option(help="Known-good committed revision or changeset.")],
+    bad: Annotated[str, typer.Option(help="Known-bad committed revision or changeset.")] = "HEAD",
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("."),
     output: Annotated[
         Path | None, typer.Option(help="Run directory (new unless --resume).")
@@ -432,7 +571,9 @@ def bisect(
             help="Test every revision to check for fixed-and-reintroduced regressions (slower)."
         ),
     ] = False,
-    scm: Annotated[str, typer.Option(help="Revision provider: git or perforce.")] = "git",
+    scm: Annotated[
+        str, typer.Option(help="Revision provider: git, perforce, plastic/uvcs, or svn.")
+    ] = "git",
     p4_client: Annotated[
         str | None, typer.Option(help="UGS/Perforce client view to clone; auto-detected by default.")
     ] = None,
@@ -441,8 +582,39 @@ def bisect(
         typer.Option(help="Perforce history scope, for example //client/Project/...."),
     ] = None,
     p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
+    git_lfs: Annotated[
+        bool,
+        typer.Option("--git-lfs/--no-git-lfs", help="Materialize Git LFS objects."),
+    ] = True,
+    git_submodules: Annotated[
+        bool,
+        typer.Option(
+            "--git-submodules/--no-git-submodules",
+            help="Initialize recursive Git submodules at recorded commits.",
+        ),
+    ] = True,
+    git_lfs_fetch: Annotated[
+        bool,
+        typer.Option(
+            "--git-lfs-fetch/--no-git-lfs-fetch",
+            help="Fetch missing LFS objects from the source repository's configured remote.",
+        ),
+    ] = True,
+    cm_executable: Annotated[
+        str, typer.Option(help="Unity Version Control CLI executable for --scm plastic/uvcs.")
+    ] = "cm",
+    svn_executable: Annotated[
+        str, typer.Option(help="Subversion CLI executable for --scm svn.")
+    ] = "svn",
+    svn_externals: Annotated[
+        bool,
+        typer.Option(
+            "--svn-externals/--no-svn-externals",
+            help="Include svn:externals; disabled by default for reproducibility.",
+        ),
+    ] = False,
 ):
-    """Locate the first bad revision in a Git or Perforce history. Executes trusted code."""
+    """Locate the first bad revision in supported source-control history. Executes trusted code."""
     if resume and output is None:
         console.print("--resume requires the original --output directory", style="red")
         raise typer.Exit(2)
@@ -461,6 +633,12 @@ def bisect(
             p4_client=p4_client,
             p4_filespec=p4_filespec,
             p4_executable=p4_executable,
+            git_lfs=git_lfs,
+            git_submodules=git_submodules,
+            git_lfs_fetch=git_lfs_fetch,
+            cm_executable=cm_executable,
+            svn_executable=svn_executable,
+            svn_externals=svn_externals,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(str(exc), style="red", markup=False)

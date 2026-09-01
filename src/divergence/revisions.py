@@ -1,4 +1,4 @@
-"""Git history provider. Only the private clone is ever checked out or cleaned."""
+"""Revision providers and source-correlation helpers."""
 
 from __future__ import annotations
 
@@ -20,9 +20,21 @@ class RevisionError(RuntimeError):
     pass
 
 
-def git(path: Path, *args: str, timeout: int = 60) -> str:
+def git(
+    path: Path,
+    *args: str,
+    timeout: int = 60,
+    extra_env: dict[str, str] | None = None,
+) -> str:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"})
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GCM_INTERACTIVE": "Never",
+        }
+    )
+    environment.update(extra_env or {})
     try:
         result = subprocess.run(
             ["git", "-c", "core.hooksPath=", "-c", "commit.gpgsign=false", "-C", str(path), *args],
@@ -61,11 +73,22 @@ class RevisionProvider(Protocol):
 class GitProvider:
     scope = "first-parent"
 
-    def __init__(self, repository: Path, run_dir: Path):
+    def __init__(
+        self,
+        repository: Path,
+        run_dir: Path,
+        *,
+        materialize_lfs: bool = True,
+        materialize_submodules: bool = True,
+        fetch_lfs: bool = True,
+    ):
         self.repository = Path(git(repository.resolve(), "rev-parse", "--show-toplevel")).resolve()
         self.run_dir = run_dir.resolve()
         self.clone = self.run_dir / "source"
         self.checkouts = self.run_dir / "checkouts"
+        self.materialize_lfs = materialize_lfs
+        self.materialize_submodules = materialize_submodules
+        self.fetch_lfs = fetch_lfs
 
     def resolve(self, ref: str) -> str:
         return git(
@@ -108,8 +131,208 @@ class GitProvider:
         target = (self.checkouts / name).resolve()
         if not target.is_relative_to(self.checkouts.resolve()) or target.exists():
             raise RevisionError("checkout target already exists or escapes the run directory")
-        git(self.clone, "worktree", "add", "--detach", str(target), revision)
-        return target
+        git(
+            self.clone,
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false",
+            "worktree",
+            "add",
+            "--detach",
+            str(target),
+            revision,
+            timeout=300,
+            extra_env={"GIT_LFS_SKIP_SMUDGE": "1"},
+        )
+        try:
+            if self.materialize_submodules and (target / ".gitmodules").is_file():
+                self._materialize_submodules(target)
+            if self.materialize_lfs:
+                self._materialize_lfs(target, self.repository, revision)
+            return target
+        except Exception:
+            try:
+                self.release(target)
+            except RevisionError:
+                pass
+            raise
+
+    @staticmethod
+    def _lfs_pointer(path: Path) -> tuple[str, int] | None:
+        if not path.is_file() or path.is_symlink():
+            return None
+        with path.open("rb") as stream:
+            raw = stream.read(1024).decode("ascii", errors="replace").replace("\r\n", "\n")
+        match = re.fullmatch(
+            r"version https://git-lfs\.github\.com/spec/v1\n"
+            r"oid sha256:([0-9a-f]{64})\n"
+            r"size ([0-9]+)\n?",
+            raw,
+        )
+        return (match.group(1), int(match.group(2))) if match else None
+
+    @staticmethod
+    def _git_common_dir(repository: Path) -> Path:
+        common = Path(git(repository, "rev-parse", "--git-common-dir"))
+        return common.resolve() if common.is_absolute() else (repository / common).resolve()
+
+    def _copy_local_lfs_objects(
+        self, source_repository: Path, target: Path, paths: list[str]
+    ) -> None:
+        source_root = self._git_common_dir(source_repository) / "lfs" / "objects"
+        if not source_root.is_dir():
+            return
+        target_root = self._git_common_dir(target) / "lfs" / "objects"
+        for relative in paths:
+            pointer = self._lfs_pointer(target / relative)
+            if pointer is None:
+                continue
+            oid, expected_size = pointer
+            source = source_root / oid[:2] / oid[2:4] / oid
+            destination = target_root / oid[:2] / oid[2:4] / oid
+            if destination.exists():
+                continue
+            if (
+                not source.is_file()
+                or source.is_symlink()
+                or source.stat().st_size != expected_size
+            ):
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.divergence-copy")
+            if temporary.exists():
+                raise RevisionError("refusing to replace an existing Git LFS cache temporary file")
+            try:
+                shutil.copyfile(source, temporary)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _hydrate_lfs(self, target: Path, paths: list[str]) -> list[str]:
+        object_root = self._git_common_dir(target) / "lfs" / "objects"
+        missing = []
+        for relative in paths:
+            destination = (target / relative).resolve()
+            if not destination.is_relative_to(target.resolve()):
+                raise RevisionError("Git LFS path escapes the isolated checkout")
+            pointer = self._lfs_pointer(destination)
+            if pointer is None:
+                continue
+            oid, expected_size = pointer
+            source = object_root / oid[:2] / oid[2:4] / oid
+            if not source.is_file() or source.is_symlink() or source.stat().st_size != expected_size:
+                missing.append(relative)
+                continue
+            digest = hashlib.sha256()
+            temporary = destination.with_name(f".{destination.name}.divergence-lfs")
+            if temporary.exists():
+                raise RevisionError("refusing to replace an existing Git LFS temporary file")
+            try:
+                mode = destination.stat().st_mode
+                with source.open("rb") as reader, temporary.open("xb") as writer:
+                    for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        writer.write(chunk)
+                if digest.hexdigest() != oid:
+                    raise RevisionError(f"Git LFS object hash mismatch for {relative}")
+                os.chmod(temporary, mode)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return missing
+
+    def _materialize_lfs(
+        self, target: Path, source_repository: Path | None, revision: str
+    ) -> None:
+        attribute_paths = git(
+            target, "ls-files", "--", ".gitattributes", "**/.gitattributes"
+        ).splitlines()
+        if not any(
+            "filter=lfs"
+            in (target / relative).read_text(encoding="utf-8", errors="replace")
+            for relative in attribute_paths
+            if (target / relative).is_file()
+        ):
+            return
+        try:
+            paths = [
+                line.strip()
+                for line in git(target, "lfs", "ls-files", "--name-only", timeout=120).splitlines()
+                if line.strip()
+            ]
+        except RevisionError as exc:
+            raise RevisionError(
+                "this revision uses Git LFS but git-lfs is unavailable; install Git LFS or use --no-git-lfs explicitly"
+            ) from exc
+        if not paths:
+            return
+        if source_repository is not None:
+            self._copy_local_lfs_objects(source_repository, target, paths)
+        missing = self._hydrate_lfs(target, paths)
+        if missing and self.fetch_lfs:
+            if source_repository is not None:
+                try:
+                    git(source_repository, "lfs", "fetch", "origin", revision, timeout=1800)
+                except RevisionError:
+                    pass
+                self._copy_local_lfs_objects(source_repository, target, paths)
+                missing = self._hydrate_lfs(target, paths)
+            if missing and "origin" in git(target, "remote").splitlines():
+                try:
+                    git(target, "lfs", "fetch", "origin", revision, timeout=1800)
+                except RevisionError:
+                    pass
+                missing = self._hydrate_lfs(target, paths)
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise RevisionError(
+                f"Git LFS content is unavailable for {preview}; fetch the objects into the source repository"
+            )
+
+    def _materialize_submodules(self, target: Path) -> None:
+        common = [
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false",
+        ]
+        git(target, *common, "submodule", "sync", "--recursive", timeout=300)
+        git(
+            target,
+            *common,
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--checkout",
+            "--force",
+            "--jobs",
+            "1",
+            timeout=1800,
+            extra_env={"GIT_LFS_SKIP_SMUDGE": "1"},
+        )
+        status = git(target, "submodule", "status", "--recursive").splitlines()
+        for line in status:
+            match = re.match(r"^[ +\-U]?([0-9a-fA-F]{40,64})\s+(.+?)(?:\s+\(.*\))?$", line)
+            if not match:
+                raise RevisionError("Git returned malformed recursive submodule status")
+            revision, relative = match.groups()
+            if line.startswith(("-", "+", "U")):
+                raise RevisionError(f"submodule was not materialized at its recorded commit: {relative}")
+            submodule = (target / relative).resolve()
+            if not submodule.is_relative_to(target.resolve()):
+                raise RevisionError("submodule path escapes the isolated checkout")
+            if self.materialize_lfs:
+                origin = git(submodule, "remote", "get-url", "origin")
+                source = Path(origin).resolve() if Path(origin).exists() else None
+                self._materialize_lfs(submodule, source, revision)
 
     def release(self, target: Path) -> None:
         target = target.resolve()
@@ -118,7 +341,12 @@ class GitProvider:
             or target == self.checkouts.resolve()
         ):
             raise RevisionError("refusing to remove a checkout outside this run")
-        git(self.clone, "worktree", "remove", "--force", str(target))
+        if (target / ".gitmodules").is_file():
+            try:
+                git(target, "submodule", "deinit", "--force", "--all", timeout=300)
+            except RevisionError:
+                pass
+        git(self.clone, "worktree", "remove", "--force", str(target), timeout=300)
 
     def describe(self, revision: str) -> dict:
         raw = git(self.repository, "show", "-s", "--format=%H%x00%s%x00%an%x00%aI", revision)
@@ -147,10 +375,29 @@ class GitProvider:
         """Git worktrees are released after each capture; keep the private clone for resume."""
 
     def identity(self) -> dict:
-        return {"kind": "git", "repository": str(self.repository)}
+        return {
+            "kind": "git",
+            "repository": str(self.repository),
+            "materialize_lfs": self.materialize_lfs,
+            "materialize_submodules": self.materialize_submodules,
+            "fetch_lfs": self.fetch_lfs,
+        }
 
     def limitations(self) -> list[str]:
-        return ["Searches a Git first-parent history."]
+        limits = ["Searches a Git first-parent history."]
+        if self.materialize_lfs:
+            limits.append(
+                "Materializes tracked Git LFS objects from the local source cache and then its configured remote; unavailable objects make a trial inconclusive."
+            )
+        else:
+            limits.append("Git LFS materialization was explicitly disabled; pointer files remain.")
+        if self.materialize_submodules:
+            limits.append(
+                "Initializes recursive submodules at recorded commits; source correlation remains scoped to the parent repository."
+            )
+        else:
+            limits.append("Git submodule materialization was explicitly disabled.")
+        return limits
 
 
 P4Runner = Callable[[list[str], Path, str | None, int], subprocess.CompletedProcess[str]]
