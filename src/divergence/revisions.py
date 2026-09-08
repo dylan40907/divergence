@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -472,7 +473,6 @@ class PerforceProvider:
         self.runner = runner or _default_p4_runner
         self.template_client = client
         self.filespec = filespec
-        self.workspace = (self.run_dir / "perforce-workspace").resolve()
         self._prepared = False
         self._active = False
         info = self._records("info", client=client)[0]
@@ -497,8 +497,8 @@ class PerforceProvider:
             raise RevisionError(
                 "the selected Perforce client does not contain the requested workspace path"
             )
-        if self.workspace.is_relative_to(self.active_root) or self.active_root.is_relative_to(
-            self.workspace
+        if self.run_dir.is_relative_to(self.active_root) or self.active_root.is_relative_to(
+            self.run_dir
         ):
             raise RevisionError(
                 "Perforce run output must be outside the active UGS client root so isolation and cleanup cannot touch it"
@@ -510,7 +510,14 @@ class PerforceProvider:
         digest = hashlib.sha256(
             f"{self.server}\0{self.user}\0{self.template_client}\0{self.run_dir}".encode()
         ).hexdigest()[:16]
-        self.client = f"divergence_{digest}"
+        self.client = f"isolated_{digest}"
+        self._workspace_base = Path(tempfile.gettempdir()).resolve()
+        self._workspace_leaf = f"isolated-p4-{digest}"
+        self.workspace = (self._workspace_base / self._workspace_leaf).resolve()
+        if self.workspace.is_relative_to(self.active_root) or self.active_root.is_relative_to(
+            self.workspace
+        ):
+            raise RevisionError("Perforce temporary workspace overlaps the active UGS client root")
         self._stream = False
 
     def _require_safe_operation(
@@ -679,7 +686,7 @@ class PerforceProvider:
             form = _set_form_field(
                 form,
                 "Description",
-                ["Temporary Divergence regression workspace; safe to delete after the run."],
+                ["Temporary isolated diagnostic workspace; safe to delete after the run."],
             )
             form = _set_form_field(form, "AltRoots", [])
             form = _set_form_field(form, "ChangeView", [])
@@ -725,9 +732,9 @@ class PerforceProvider:
 
     def _remove_workspace(self) -> None:
         target = self.workspace.resolve()
-        expected = (self.run_dir / "perforce-workspace").resolve()
-        if target != expected or not target.is_relative_to(self.run_dir):
-            raise RevisionError("refusing to remove a Perforce workspace outside this run")
+        expected = (self._workspace_base / self._workspace_leaf).resolve()
+        if target != expected or target.parent != self._workspace_base:
+            raise RevisionError("refusing to remove an unknown Perforce temporary workspace")
         if not target.exists():
             return
 

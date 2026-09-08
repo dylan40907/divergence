@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -51,7 +52,6 @@ class PlasticProvider:
         self.run_dir = run_dir.resolve()
         self.executable = executable
         self.runner = runner or _default_runner
-        self.workspace = (self.run_dir / "plastic-workspace").resolve()
         workspace = self._invoke(
             "getworkspacefrompath",
             str(self.repository),
@@ -79,7 +79,14 @@ class PlasticProvider:
         digest = hashlib.sha256(
             f"{self.repository_spec}\0{self.branch}\0{self.run_dir}".encode()
         ).hexdigest()[:16]
-        self.workspace_name = f"divergence_{digest}"
+        self.workspace_name = f"isolated_{digest}"
+        self._workspace_base = Path(tempfile.gettempdir()).resolve()
+        self._workspace_leaf = f"isolated-uvcs-{digest}"
+        self.workspace = (self._workspace_base / self._workspace_leaf).resolve()
+        if self.workspace.is_relative_to(self.active_root) or self.active_root.is_relative_to(
+            self.workspace
+        ):
+            raise RevisionError("UVCS temporary workspace overlaps the active workspace root")
         self._active = False
 
     def _invoke(self, *args: str, cwd: Path | None = None, timeout: int = 300) -> str:
@@ -227,9 +234,9 @@ class PlasticProvider:
 
     def _remove_workspace(self) -> None:
         target = self.workspace.resolve()
-        expected = (self.run_dir / "plastic-workspace").resolve()
-        if target != expected or not target.is_relative_to(self.run_dir):
-            raise RevisionError("refusing to remove a UVCS workspace outside this run")
+        expected = (self._workspace_base / self._workspace_leaf).resolve()
+        if target != expected or target.parent != self._workspace_base:
+            raise RevisionError("refusing to remove an unknown UVCS temporary workspace")
         if not target.exists():
             return
 

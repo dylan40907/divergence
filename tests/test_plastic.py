@@ -134,6 +134,8 @@ def test_plastic_search_uses_disposable_workspace_and_preserves_active_workspace
     fake = FakePlastic(active)
     output = tmp_path / "run"
     provider = PlasticProvider(active, output, runner=fake)
+    assert provider.workspace_name.startswith("isolated_")
+    assert "divergence" not in provider.workspace_name.lower()
     assert provider.history("100", "160") == fake.changes
     assert provider.inspect()["branch"] == "/main"
 
@@ -152,6 +154,7 @@ def test_plastic_search_uses_disposable_workspace_and_preserves_active_workspace
     assert sentinel.read_text() == "active edit"
     assert not provider.workspace.exists()
     assert len(fake.created) == len(fake.deleted)
+    assert all("divergence" not in str(path).lower() for path in fake.created)
 
     update_count = len(fake.updated)
     resumed = Search(

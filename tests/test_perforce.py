@@ -260,6 +260,9 @@ def test_perforce_partial_sync_and_failed_client_validation_are_cleaned(tmp_path
     fake = FakePerforce(active, fail_sync=True)
     provider = PerforceProvider(active, tmp_path / "run", runner=fake)
     provider.prepare()
+    saved_form = fake.clients[provider.client][0]
+    assert provider.client.startswith("isolated_")
+    assert "divergence" not in saved_form.lower()
     with pytest.raises(RevisionError, match="interrupted sync"):
         provider.checkout("100", "trial")
     provider.cleanup()
