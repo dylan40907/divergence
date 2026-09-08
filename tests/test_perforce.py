@@ -286,6 +286,30 @@ def test_perforce_rejects_invalid_or_non_submitted_revisions(tmp_path):
         provider.resolve("999")
 
 
+def test_perforce_refuses_depot_mutations_and_template_client_sync(tmp_path):
+    active = tmp_path / "active"
+    active.mkdir()
+    fake = FakePerforce(active)
+    provider = PerforceProvider(active, tmp_path / "run", runner=fake)
+    calls_before = len(fake.syncs)
+
+    for operation in (
+        ("submit", "-d", "must never run"),
+        ("shelve", "-c", "123"),
+        ("edit", "//depot/main/app.py"),
+        ("add", "//depot/main/new.py"),
+        ("delete", "//depot/main/app.py"),
+        ("reconcile", "//depot/main/..."),
+        ("change", "-i"),
+    ):
+        with pytest.raises(RevisionError, match="read/isolation allowlist"):
+            provider._invoke(*operation)
+
+    with pytest.raises(RevisionError, match="read/isolation allowlist"):
+        provider._invoke("sync", "//ugs_main/...@100", client=provider.template_client)
+    assert len(fake.syncs) == calls_before
+
+
 def test_unreal_init_and_report_bridge(tmp_path, monkeypatch):
     recipe = tmp_path / "unreal.yaml"
     result = CliRunner().invoke(

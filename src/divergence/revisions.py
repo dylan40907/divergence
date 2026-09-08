@@ -513,6 +513,69 @@ class PerforceProvider:
         self.client = f"divergence_{digest}"
         self._stream = False
 
+    def _require_safe_operation(
+        self,
+        args: tuple[str, ...],
+        *,
+        selected_client: str | None,
+        input_text: str | None,
+    ) -> None:
+        """Constrain P4 to history reads and an owned disposable client.
+
+        This is a defense-in-depth boundary: adding a new P4 operation requires an explicit review
+        here. In particular, depot mutations such as submit, shelve, edit, add, delete, integrate,
+        and reconcile are never accepted.
+        """
+
+        def refuse() -> None:
+            operation = args[0] if args else "<empty>"
+            raise RevisionError(
+                f"Perforce operation {operation!r} is outside Divergence's read/isolation allowlist"
+            )
+
+        if not args:
+            refuse()
+        operation = args[0]
+        owned_client = getattr(self, "client", None)
+        if operation == "info" and len(args) == 1:
+            return
+        if operation == "changes":
+            return
+        if operation == "change" and len(args) == 3 and args[1] == "-o":
+            return
+        if operation == "describe" and len(args) == 3 and args[1] in {"-s", "-du"}:
+            return
+        if operation == "print" and len(args) == 3 and args[1] == "-q":
+            return
+        if operation in {"sync", "revert"}:
+            if owned_client and selected_client == owned_client:
+                return
+            refuse()
+        if operation != "client":
+            refuse()
+
+        tail = args[1:]
+        if len(tail) == 2 and tail[0] == "-o" and tail[1] in {
+            self.template_client,
+            owned_client,
+        }:
+            return
+        if (
+            len(tail) == 4
+            and tail[0] == "-t"
+            and tail[1] == self.template_client
+            and tail[2] == "-o"
+            and owned_client
+            and tail[3] == owned_client
+        ):
+            return
+        if tail == ("-i",) and owned_client and input_text:
+            if _form_fields(input_text).get("Client") == [owned_client]:
+                return
+        if len(tail) == 2 and tail[0] == "-d" and owned_client and tail[1] == owned_client:
+            return
+        refuse()
+
     def _invoke(
         self,
         *args: str,
@@ -528,6 +591,7 @@ class PerforceProvider:
         selected = client if client is not None else self.template_client
         if selected:
             argv.extend(["-c", selected])
+        self._require_safe_operation(args, selected_client=selected, input_text=input_text)
         argv.extend(args)
         try:
             result = self.runner(argv, self.repository, input_text, timeout)
