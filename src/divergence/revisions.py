@@ -511,6 +511,12 @@ class PerforceProvider:
             f"{self.server}\0{self.user}\0{self.template_client}\0{self.run_dir}".encode()
         ).hexdigest()[:16]
         self.client = f"isolated_{digest}"
+        template_prefix = f"//{self.template_client}/"
+        self.sync_filespec = (
+            f"//{self.client}/{self.filespec.removeprefix(template_prefix)}"
+            if self.filespec.startswith(template_prefix)
+            else self.filespec
+        )
         self._workspace_base = Path(tempfile.gettempdir()).resolve()
         self._workspace_leaf = f"isolated-p4-{digest}"
         self.workspace = (self._workspace_base / self._workspace_leaf).resolve()
@@ -635,6 +641,7 @@ class PerforceProvider:
             "active_client_root": str(self.active_root),
             "stream": (self.template_fields.get("Stream") or [""])[0] or "classic view",
             "search_filespec": self.filespec,
+            "materialize_filespec": self.sync_filespec,
             "temporary_client": self.client,
             "temporary_root": str(self.workspace),
         }
@@ -725,7 +732,7 @@ class PerforceProvider:
         args = ["sync", "-q"]
         if self._stream:
             args.append(f"--use-stream-change={revision}")
-        args.append(f"//{self.client}/...@{revision}")
+        args.append(f"{self.sync_filespec}@{revision}")
         self._invoke(*args, client=self.client, timeout=3600)
         self._active = True
         return self.workspace
@@ -749,11 +756,13 @@ class PerforceProvider:
             raise RevisionError("refusing to release an unknown Perforce workspace")
         try:
             try:
-                self._invoke("revert", f"//{self.client}/...", client=self.client)
+                self._invoke("revert", self.sync_filespec, client=self.client)
             except RevisionError as exc:
                 if "not opened" not in str(exc).lower():
                     raise
-            self._invoke("sync", "-q", f"//{self.client}/...#none", client=self.client, timeout=3600)
+            self._invoke(
+                "sync", "-q", f"{self.sync_filespec}#none", client=self.client, timeout=3600
+            )
         finally:
             self._active = False
             self._remove_workspace()

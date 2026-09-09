@@ -213,7 +213,10 @@ def perforce_check(
         str | None, typer.Option(help="UGS/Perforce client; auto-detected by default.")
     ] = None,
     p4_filespec: Annotated[
-        str | None, typer.Option(help="History scope; defaults to the complete selected client view.")
+        str | None,
+        typer.Option(
+            help="History and materialization scope; defaults to the complete selected client view."
+        ),
     ] = None,
     p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
 ):
@@ -238,7 +241,7 @@ def perforce_check(
         table.add_row(key.replace("_", " ").title(), str(value))
     console.print(table)
     console.print(
-        "Read-only check complete. A real run creates a separate temporary client under its output directory.",
+        "Read-only check complete. A real run creates a separate temporary client at the displayed temporary root.",
         style="green",
     )
 
@@ -471,7 +474,9 @@ def verify(
     ] = None,
     p4_filespec: Annotated[
         str | None,
-        typer.Option(help="Perforce history scope, for example //client/Project/...."),
+        typer.Option(
+            help="Perforce history and materialization scope, for example //client/Project/...."
+        ),
     ] = None,
     p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
     git_lfs: Annotated[
@@ -579,7 +584,9 @@ def bisect(
     ] = None,
     p4_filespec: Annotated[
         str | None,
-        typer.Option(help="Perforce history scope, for example //client/Project/...."),
+        typer.Option(
+            help="Perforce history and materialization scope, for example //client/Project/...."
+        ),
     ] = None,
     p4_executable: Annotated[str, typer.Option(help="Perforce CLI executable.")] = "p4",
     git_lfs: Annotated[

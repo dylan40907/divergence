@@ -188,6 +188,7 @@ def test_perforce_search_uses_disposable_client_and_preserves_ugs_workspace(
     output = tmp_path / "run"
     provider = PerforceProvider(active, output, runner=fake)
     assert provider.inspect()["template_client"] == "ugs_main"
+    assert provider.inspect()["materialize_filespec"] == f"//{provider.client}/..."
     assert provider.history("100", "160") == fake.changes
 
     result = Search(
@@ -249,6 +250,26 @@ def test_perforce_refuses_run_workspace_nested_in_active_ugs_workspace(tmp_path)
     project.mkdir()
     with pytest.raises(RevisionError, match="client root"):
         PerforceProvider(project, active / "other-run", runner=FakePerforce(active))
+
+
+def test_perforce_filespec_limits_materialized_content(tmp_path):
+    active = tmp_path / "active"
+    active.mkdir()
+    fake = FakePerforce(active)
+    filespec = "//depot/main/app.py"
+    provider = PerforceProvider(active, tmp_path / "run", filespec=filespec, runner=fake)
+
+    assert provider.inspect()["search_filespec"] == filespec
+    assert provider.inspect()["materialize_filespec"] == filespec
+    provider.prepare()
+    workspace = provider.checkout("100", "trial")
+    provider.release(workspace)
+    provider.cleanup()
+
+    assert fake.syncs[0] == (provider.client, f"{filespec}@100")
+    assert fake.syncs[-1] == (provider.client, f"{filespec}#none")
+    assert fake.deleted == [provider.client]
+    assert not provider.workspace.exists()
 
 
 def test_perforce_partial_sync_and_failed_client_validation_are_cleaned(tmp_path):
