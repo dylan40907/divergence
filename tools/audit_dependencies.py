@@ -1,6 +1,6 @@
 """Match this interpreter's distributions against a local OSV PyPI ZIP. No network I/O.
 
-Download the public ecosystem snapshot separately; see docs/RELEASING.md.
+Download the snapshot first: https://storage.googleapis.com/osv-vulnerabilities/PyPI/all.zip
 Unknown range formats fail the audit instead of being reported as clean.
 """
 

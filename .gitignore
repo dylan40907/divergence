@@ -1,6 +1,17 @@
+# Environments and local tools
 .venv/
+venv/
 .tools/
+.env
+.env.*
+!.env.example
+
+# Run output and evidence
 .divergence/
+demo-workspace/
+*.log
+
+# Python and build output
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,8 +21,7 @@ dist/
 build/
 .coverage
 htmlcov/
-.env
-.env.*
-!.env.example
-demo-workspace/
-*.log
+
+# Editor folders
+.vscode/
+.idea/

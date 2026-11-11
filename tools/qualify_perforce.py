@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import secrets
 import socket
 import stat
 import subprocess
@@ -68,7 +69,7 @@ def qualify(p4: Path, output: Path) -> dict:
     # A fresh Helix Core server grants its operating-system account the initial
     # superuser identity. No password, ticket, or external P4 configuration is used.
     user = os.environ.get("USERNAME") or getpass.getuser()
-    password = f"Aa1-{os.urandom(12).hex()}"  # throwaway server, new each run
+    password = f"Aa1-{secrets.token_urlsafe(18)}"  # throwaway server, new each run
     client = "active-ugs"
     p4d = p4.with_name("p4d.exe" if os.name == "nt" else "p4d")
     if not p4d.is_file():

@@ -85,7 +85,6 @@ def package(root: Path, sample_report: Path) -> Path:
                     raise ValueError(f"source archive is stale: {item.name}; rebuild it")
     for name in [
         "README.md",
-        "QUICKSTART.md",
         "CHANGELOG.md",
         "LICENSE",
         "SECURITY.md",
@@ -95,16 +94,9 @@ def package(root: Path, sample_report: Path) -> Path:
         "docs/ADAPTERS.md",
         "docs/DESIGN.md",
         "docs/EVALUATION.md",
-        "docs/STATUS.md",
-        "docs/RELEASE_CHECKLIST.md",
-        "docs/RELEASING.md",
-        "docs/DEPENDENCIES.md",
-        "docs/EXTERNAL_VALIDATION.md",
-        "docs/PUBLIC_RELEASE.md",
-        "docs/BACKUP.md",
         "docs/PERFORCE_UGS.md",
         "docs/VERSION_CONTROL.md",
-        "docs/assets/report.png",
+        "docs/images/report.png",
     ]:
         payload[name] = (root / name).read_bytes()
     payload["examples/cart-report.html"] = distribution_sample(sample_report.read_bytes())
